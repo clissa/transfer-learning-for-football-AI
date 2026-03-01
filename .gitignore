@@ -12,3 +12,8 @@ results/
 *.pt
 *.pth
 *.ckpt
+*.egg-info/
+dist/
+build/
+
+.vscode/
