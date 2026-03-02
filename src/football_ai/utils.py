@@ -25,6 +25,79 @@ def slug(text: str) -> str:
     return text
 
 
+def make_dataset_key(league: str, season: str) -> str:
+    """Build a dataset key (e.g., 'serie_a_2015_2016') from league/season labels."""
+    return f"{slug(league)}_{slug(season)}"
+
+
+def split_dataset_key(dataset_key: str) -> tuple[str, str]:
+    """Split dataset key into normalized (league, season_display) values."""
+    m2 = re.match(r"^(.*)_(\d{4}_\d{4})$", dataset_key)
+    m1 = re.match(r"^(.*)_(\d{4})$", dataset_key)
+    if m2:
+        league_slug, season_slug = m2.group(1), m2.group(2)
+    elif m1:
+        league_slug, season_slug = m1.group(1), m1.group(2)
+    else:
+        league_slug, season_slug = dataset_key, "unknown"
+    return league_slug.replace("_", " "), season_slug.replace("_", "/")
+
+
+def list_available_dataset_keys(
+    data_dir: str | os.PathLike[str],
+) -> list[str]:
+    """Return sorted dataset keys where both features and labels files exist."""
+    data_dir = Path(data_dir)
+    keys: set[str] = set()
+    for feature_path in data_dir.glob("features_*.h5"):
+        dataset_key = feature_path.stem[len("features_") :]
+        labels_path = data_dir / f"labels_{dataset_key}.h5"
+        if labels_path.exists():
+            keys.add(dataset_key)
+    return sorted(keys)
+
+
+def load_dataset_tables(
+    dataset_key: str,
+    data_dir: str | os.PathLike[str],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Load features and labels tables for one dataset key."""
+    data_dir = Path(data_dir)
+    features_path = data_dir / f"features_{dataset_key}.h5"
+    labels_path = data_dir / f"labels_{dataset_key}.h5"
+
+    if not features_path.exists():
+        raise FileNotFoundError(f"Missing features file: {features_path}")
+    if not labels_path.exists():
+        raise FileNotFoundError(f"Missing labels file: {labels_path}")
+
+    features_df = pd.read_hdf(features_path, key="features")
+    labels_df = pd.read_hdf(labels_path, key="labels")
+    return features_df, labels_df
+
+
+def load_xy(
+    dataset_key: str,
+    target_col: str,
+    data_dir: str | os.PathLike[str],
+) -> tuple[pd.DataFrame, pd.Series]:
+    """Load X/y for one dataset key from features/labels HDF5 files."""
+    if target_col not in {"scores", "concedes"}:
+        raise ValueError("target_col must be either 'scores' or 'concedes'")
+
+    df_features, df_labels = load_dataset_tables(dataset_key=dataset_key, data_dir=data_dir)
+    df = df_features.merge(df_labels, on=["game_id", "action_id"], how="inner")
+
+    feature_cols = [
+        col
+        for col in df.columns
+        if col not in {"game_id", "action_id", "scores", "concedes"}
+    ]
+    X = df[feature_cols].replace([float("inf"), float("-inf")], pd.NA).fillna(0)
+    y = df[target_col].astype(int)
+    return X, y
+
+
 def make_statsbomb_loader(data_root: str | os.PathLike[str]) -> StatsBombLoader:
     """Create a StatsBomb local-data loader."""
     return StatsBombLoader(getter="local", root=str(data_root))
