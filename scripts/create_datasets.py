@@ -9,14 +9,14 @@ from football_ai import utils as football_utils
 # =========================
 # StatsBomb open-data JSON folder (specify relative to current working directory, i.e. where you run this script from)
 DATA_ROOT = "../open-data/data"  # currently expected to be the repo root
-OUTPUT_DIR = "test-data/spadl_data"
+OUTPUT_DIR = "data/spadl_data"
 
 SAVE_ALL_AVAILABLE = False
 
 # Used only when SAVE_ALL_AVAILABLE=False
 SELECTED_NAME_PAIRS: list[tuple[str, str]] = [
     # ("Serie A", "2015/2016"),
-    ("Champions League", "2015/2016"),
+    # ("Champions League", "2015/2016"),
 ]
 
 # Used only when SAVE_ALL_AVAILABLE=False
@@ -27,22 +27,6 @@ SELECTED_ID_PAIRS: list[tuple[int, int]] = [
 # Number of previous actions to include in the dataset (for context)
 NUMBER_PREVIOUS_ACTIONS = 3
 # =========================
-
-
-# def _load_utils_module():
-#     """Load utilities from src/football-ai without requiring package installation."""
-#     repo_root = Path(__file__).resolve().parent.parent
-#     utils_path = repo_root / "src" / "football-ai" / "utils.py"
-#     if not utils_path.exists():
-#         raise FileNotFoundError(f"Missing expected module file: {utils_path}")
-
-#     spec = importlib.util.spec_from_file_location("football_ai_utils", utils_path)
-#     if spec is None or spec.loader is None:
-#         raise ImportError(f"Cannot create module spec for: {utils_path}")
-
-#     module = importlib.util.module_from_spec(spec)
-#     spec.loader.exec_module(module)
-#     return module
 
 
 def main() -> int:
