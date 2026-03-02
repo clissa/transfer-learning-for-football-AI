@@ -23,8 +23,8 @@ Utilities and scripts for creating SPADL/VAEP datasets from StatsBomb open data.
 ### 1) Create and activate a virtual environment
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
+python3 -m venv ./football_ai_venv
+source ./football_ai_venv/bin/activate
 ```
 
 ### 2) Install dependencies
@@ -32,16 +32,12 @@ source .venv/bin/activate
 Option A (exact pinned environment):
 
 ```bash
+# runtime dependecies
 pip install -r requirements.txt
-```
 
-Option B (install package in editable mode):
-
-```bash
+# football_ai local package
 pip install -e .
 ```
-
-If you use Option B only, also install runtime dependencies (for example `socceraction`, `pandas`, `tables`, `scikit-learn`) if they are not already available in your environment.
 
 ## Running data preparation
 
@@ -53,14 +49,14 @@ python scripts/create_datasets.py
 
 ### Prerequisite data location
 
-By default, `scripts/create_datasets.py` expects StatsBomb open-data JSON files at:
+By default, `scripts/create_datasets.py` expects StatsBomb open-data JSON files at the [StatsBomb open-data repository](https://github.com/statsbomb/open-data):
 
 ```text
 ../open-data/data
 ```
 
 This path is controlled by `DATA_ROOT` in [`scripts/create_datasets.py`](scripts/create_datasets.py).  
-Update it if your open-data checkout is elsewhere.
+Update it if your `open-data` checkout is elsewhere.
 
 ### Competition/season selection
 
@@ -75,7 +71,7 @@ Use either `SELECTED_NAME_PAIRS` or `SELECTED_ID_PAIRS`, not both.
 
 ### Output files
 
-The script writes HDF5 feature/label files to `OUTPUT_DIR` (default: `test-data/spadl_data`) with names like:
+The script writes HDF5 feature/label files to `OUTPUT_DIR` (default: `data/spadl_data`) with names like:
 
 - `features_<competition>_<season>.h5`
 - `labels_<competition>_<season>.h5`
@@ -84,3 +80,11 @@ Each file contains one table key:
 
 - features file: `features`
 - labels file: `labels`
+
+## Notebooks
+
+The `notebooks/` folder contains interactive Jupyter notebooks:
+
+- `create_spadl_dataset.ipynb`: Initial full data preparation and model training pipeline.
+- `socceraction_supervised_learning_simple.ipynb`: Simplified training example as a starter point for experimentation.
+
