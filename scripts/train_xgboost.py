@@ -18,7 +18,7 @@ from sklearn.metrics import (
 )
 from xgboost import XGBClassifier
 
-from football_ai.utils import make_dataset_key
+from football_ai.utils import list_available_dataset_keys
 
 
 # =========================
@@ -30,11 +30,22 @@ TARGET_COL = "scores"  # or "concedes"
 RESULTS_PATH = Path("results/debug_train_xgboost")
 RESULTS_PATH.mkdir(parents=True, exist_ok=True)
 
-TRAIN_LEAGUE = "La Liga"
-TRAIN_SEASON = "2015/2016"
+TRAIN_COMPETITION_PREFIXES = [
+    "1_bundesliga",
+    "la_liga",
+    "ligue_1",
+    "premier_league",
+    "serie_a",
+]
+TEST_COMPETITION_PREFIXES = [
+    "champions_league",
+    "uefa_europa_league",
+]
 
-TEST_LEAGUE = "Champions League"
-TEST_SEASON = "2015/2016"
+# Optional season filters by suffix on dataset key, e.g. ["2015_2016"].
+# Keep None to include all available seasons for selected competitions.
+TRAIN_SEASON_SUFFIXES: list[str] | None = None
+TEST_SEASON_SUFFIXES: list[str] | None = None
 
 # Validation split inside TRAIN_LEAGUE/TRAIN_SEASON (game_id-level split)
 VAL_PCT = 0.20
@@ -54,12 +65,8 @@ EVAL_METRIC: str | list[str] = ["aucpr", "auc", "logloss"]
 
 # Which validation set to pass into fit(eval_set=...):
 # - "train_val_split" -> use X_val/y_val from VAL_PCT split on train league/season
-# - "external_league" -> use EXTERNAL_VAL_LEAGUE/SEASON dataset
 # - "none" -> do not pass eval_set to fit
 VALIDATION_SET_MODE = "train_val_split"
-
-EXTERNAL_VAL_LEAGUE = "Premier League"
-EXTERNAL_VAL_SEASON = "2015/2016"
 
 # If True, include training data in eval_set as first tuple: [(X_train, y_train), (X_val, y_val)]
 INCLUDE_TRAIN_IN_EVAL_SET = False
@@ -170,31 +177,54 @@ def _read_dataset(dataset_key: str, data_dir: Path) -> pd.DataFrame:
     return df_features.merge(df_labels, on=["game_id", "action_id"], how="inner")
 
 
+def resolve_dataset_keys(
+    available_dataset_keys: list[str],
+    competition_prefixes: list[str],
+    season_suffixes: list[str] | None = None,
+) -> list[str]:
+    keys = [
+        k
+        for k in available_dataset_keys
+        if any(k.startswith(prefix + "_") for prefix in competition_prefixes)
+    ]
+    if season_suffixes:
+        keys = [k for k in keys if any(k.endswith(suffix) for suffix in season_suffixes)]
+    return sorted(keys)
+
+
 def load_xy(
-    dataset_key: str,
+    dataset_keys: list[str],
     target_col: str,
     data_dir: Path,
     val_pct: float = 0.2,
     random_state: int = 42,
 ) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.Series]:
     """
-    Load and split one league-season into train/val based on unique game_id.
+    Load and split multiple datasets into train/val based on unique game identifiers.
     This prevents leakage of actions from the same game across splits.
     """
     if target_col not in {"scores", "concedes"}:
         raise ValueError("target_col must be 'scores' or 'concedes'")
     if not (0 <= val_pct < 1):
         raise ValueError("val_pct must be in [0, 1)")
+    if not dataset_keys:
+        raise ValueError("dataset_keys is empty")
 
-    df = _read_dataset(dataset_key=dataset_key, data_dir=data_dir)
+    frames: list[pd.DataFrame] = []
+    for dataset_key in dataset_keys:
+        df_part = _read_dataset(dataset_key=dataset_key, data_dir=data_dir).copy()
+        df_part["__dataset_key"] = dataset_key
+        frames.append(df_part)
+    df = pd.concat(frames, ignore_index=True)
 
     feature_cols = [
         col
         for col in df.columns
-        if col not in {"game_id", "action_id", "scores", "concedes"}
+        if col not in {"game_id", "action_id", "scores", "concedes", "__dataset_key"}
     ]
 
-    game_ids = np.array(sorted(df["game_id"].unique()))
+    split_game_key = df["__dataset_key"].astype(str) + "::" + df["game_id"].astype(str)
+    game_ids = np.array(sorted(split_game_key.unique()))
     rng = np.random.default_rng(random_state)
     rng.shuffle(game_ids)
 
@@ -202,7 +232,7 @@ def load_xy(
     val_game_ids = set(game_ids[:n_val_games])
     print(f"Total games: {len(game_ids)}, Validation games: {n_val_games}")
 
-    is_val = df["game_id"].isin(val_game_ids)
+    is_val = split_game_key.isin(val_game_ids)
     df_train = df.loc[~is_val].copy()
     df_val = df.loc[is_val].copy()
 
@@ -216,11 +246,16 @@ def load_xy(
 
 
 def load_xy_all(
-    dataset_key: str,
+    dataset_keys: list[str],
     target_col: str,
     data_dir: Path,
 ) -> tuple[pd.DataFrame, pd.Series]:
-    df = _read_dataset(dataset_key=dataset_key, data_dir=data_dir)
+    if not dataset_keys:
+        raise ValueError("dataset_keys is empty")
+    frames: list[pd.DataFrame] = []
+    for dataset_key in dataset_keys:
+        frames.append(_read_dataset(dataset_key=dataset_key, data_dir=data_dir))
+    df = pd.concat(frames, ignore_index=True)
     feature_cols = [
         col
         for col in df.columns
@@ -249,17 +284,8 @@ def build_eval_set(
         eval_set.append((X_val.reindex(columns=train_feature_cols, fill_value=0), y_val))
         return eval_set, "train_val_split"
 
-    if mode == "external_league":
-        external_key = make_dataset_key(EXTERNAL_VAL_LEAGUE, EXTERNAL_VAL_SEASON)
-        X_ext, y_ext = load_xy_all(dataset_key=external_key, target_col=TARGET_COL, data_dir=DATA_DIR)
-        eval_set_ext: list[tuple[pd.DataFrame, pd.Series]] = []
-        if INCLUDE_TRAIN_IN_EVAL_SET:
-            eval_set_ext.append((X_train, y_train))
-        eval_set_ext.append((X_ext.reindex(columns=train_feature_cols, fill_value=0), y_ext))
-        return eval_set_ext, f"external_league:{external_key}"
-
     raise ValueError(
-        "VALIDATION_SET_MODE must be one of: 'train_val_split', 'external_league', 'none'"
+        "VALIDATION_SET_MODE must be one of: 'train_val_split', 'none'"
     )
 
 
@@ -368,11 +394,24 @@ def main() -> int:
     if not DATA_DIR.exists():
         raise FileNotFoundError(f"DATA_DIR does not exist: {DATA_DIR.resolve()}")
 
-    train_key = make_dataset_key(TRAIN_LEAGUE, TRAIN_SEASON)
-    test_key = make_dataset_key(TEST_LEAGUE, TEST_SEASON)
+    available_dataset_keys = list_available_dataset_keys(DATA_DIR)
+    train_keys = resolve_dataset_keys(
+        available_dataset_keys=available_dataset_keys,
+        competition_prefixes=TRAIN_COMPETITION_PREFIXES,
+        season_suffixes=TRAIN_SEASON_SUFFIXES,
+    )
+    test_keys = resolve_dataset_keys(
+        available_dataset_keys=available_dataset_keys,
+        competition_prefixes=TEST_COMPETITION_PREFIXES,
+        season_suffixes=TEST_SEASON_SUFFIXES,
+    )
+    if not train_keys:
+        raise ValueError("No train datasets resolved from TRAIN_COMPETITION_PREFIXES/SEASON_SUFFIXES")
+    if not test_keys:
+        raise ValueError("No test datasets resolved from TEST_COMPETITION_PREFIXES/SEASON_SUFFIXES")
 
     X_train, y_train, X_val, y_val = load_xy(
-        dataset_key=train_key,
+        dataset_keys=train_keys,
         target_col=TARGET_COL,
         data_dir=DATA_DIR,
         val_pct=VAL_PCT,
@@ -405,15 +444,15 @@ def main() -> int:
     print("Target:", TARGET_COL)
     print("Objective:", XGB_MODEL_CONFIG.get("objective"))
     print("Eval metric:", XGB_MODEL_CONFIG.get("eval_metric"))
-    print("Train dataset:", train_key)
+    print("Train datasets:", len(train_keys), train_keys[:10], "..." if len(train_keys) > 10 else "")
     print("Validation mode:", eval_set_name)
-    print("Test dataset:", test_key)
+    print("Test datasets:", len(test_keys), test_keys[:10], "..." if len(test_keys) > 10 else "")
     print("Validation pct (game split):", VAL_PCT)
 
     model.fit(X_train, y_train, **fit_kwargs)
 
     X_test, y_test = load_xy_all(
-        dataset_key=test_key,
+        dataset_keys=test_keys,
         target_col=TARGET_COL,
         data_dir=DATA_DIR,
     )
@@ -454,9 +493,9 @@ def main() -> int:
         {
             "split": ["train", "validation", "test"],
             "league_season": [
-                f"{TRAIN_LEAGUE}_{TRAIN_SEASON}",
-                f"{TRAIN_LEAGUE}_{TRAIN_SEASON}",
-                f"{TEST_LEAGUE}_{TEST_SEASON}",
+                "major_leagues_group",
+                "major_leagues_group",
+                "european_competitions_group",
             ],
             **{k: [train_metrics[k], val_metrics[k], test_metrics[k]] for k in train_metrics},
         }
@@ -478,8 +517,10 @@ def main() -> int:
             "target": [TARGET_COL],
             "objective": [XGB_MODEL_CONFIG.get("objective")],
             "eval_metric": [str(XGB_MODEL_CONFIG.get("eval_metric"))],
-            "train_league_season": [f"{TRAIN_LEAGUE}_{TRAIN_SEASON}"],
-            "test_league_season": [f"{TEST_LEAGUE}_{TEST_SEASON}"],
+            "train_dataset_group": [str(TRAIN_COMPETITION_PREFIXES)],
+            "test_dataset_group": [str(TEST_COMPETITION_PREFIXES)],
+            "train_dataset_keys": [str(train_keys)],
+            "test_dataset_keys": [str(test_keys)],
             "validation_set_mode": [eval_set_name],
             "val_pct": [VAL_PCT],
             "random_state": [RANDOM_STATE],
