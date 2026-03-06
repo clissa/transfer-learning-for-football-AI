@@ -18,38 +18,28 @@ from sklearn.metrics import (
 )
 from xgboost import XGBClassifier
 
-from football_ai.utils import list_available_dataset_keys
-
 
 # =========================
 # Global config
 # =========================
-DATA_DIR = Path("data/spadl_data")
+DATA_FILE = Path("data/spadl_data_rich/major_leagues.h5")
+RICH_ACTIONS_KEYS = ["rich_action", "rich_actions"]
 TARGET_COL = "scores"  # or "concedes"
 
-RESULTS_PATH = Path("results/debug_train_xgboost")
+RESULTS_PATH = Path("results/debug_train_xgboost_rich")
 RESULTS_PATH.mkdir(parents=True, exist_ok=True)
 
-TRAIN_COMPETITION_PREFIXES = [
-    "1_bundesliga",
-    "la_liga",
-    "ligue_1",
-    "premier_league",
-    "serie_a",
+VALIDATION_COMPETITIONS = [
+    "Serie A",
+    "Ligue 1",
 ]
-TEST_COMPETITION_PREFIXES = [
-    "champions_league",
-    "uefa_europa_league",
+TEST_COMPETITIONS = [
+    "Champions League",
+    "UEFA Europa League",
 ]
-
-# Optional season filters by suffix on dataset key, e.g. ["2015_2016"].
-# Keep None to include all available seasons for selected competitions.
-TRAIN_SEASON_SUFFIXES: list[str] | None = None
-TEST_SEASON_SUFFIXES: list[str] | None = None
-
-# Validation split inside TRAIN_LEAGUE/TRAIN_SEASON (game_id-level split)
-VAL_PCT = 0.20
-RANDOM_STATE = 20260304
+# Keep None to automatically use all remaining competitions as train.
+TRAIN_COMPETITIONS: list[str] | None = None
+RANDOM_STATE = 20260305
 
 # XGBoost objective/loss examples:
 # - "binary:logistic" (binary probabilities)
@@ -64,7 +54,7 @@ OBJECTIVE = "binary:logistic"
 EVAL_METRIC: str | list[str] = ["aucpr", "auc", "logloss"]
 
 # Which validation set to pass into fit(eval_set=...):
-# - "train_val_split" -> use X_val/y_val from VAL_PCT split on train league/season
+# - "train_val_split" -> use predefined validation competitions
 # - "none" -> do not pass eval_set to fit
 VALIDATION_SET_MODE = "train_val_split"
 
@@ -78,7 +68,7 @@ PRED_THRESHOLD = 0.5
 ENABLE_THRESHOLD_SWEEP = True
 THRESHOLD_MIN = 0.05
 THRESHOLD_MAX = 0.95
-THRESHOLD_STEPS = 20
+THRESHOLD_STEPS = 90
 
 # Keep only non-None params when building estimator / fit kwargs.
 XGB_MODEL_CONFIG: dict[str, Any] = {
@@ -87,7 +77,7 @@ XGB_MODEL_CONFIG: dict[str, Any] = {
     "booster": "gbtree",  # gbtree, gblinear, dart
     "tree_method": "hist",  # auto, exact, approx, hist
     "device": "cuda",  # cpu, cuda
-    "n_estimators": 500,
+    "n_estimators": 2000,
     "learning_rate": 0.05,
     "verbosity": 1,
     "n_jobs": -1,
@@ -163,78 +153,75 @@ def _drop_none(d: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in d.items() if v is not None}
 
 
-def _read_dataset(dataset_key: str, data_dir: Path) -> pd.DataFrame:
-    features_path = data_dir / f"features_{dataset_key}.h5"
-    labels_path = data_dir / f"labels_{dataset_key}.h5"
+def _read_rich_actions(data_file: Path, key_candidates: list[str]) -> pd.DataFrame:
+    if not data_file.exists():
+        raise FileNotFoundError(f"Missing H5 dataset file: {data_file}")
 
-    if not features_path.exists():
-        raise FileNotFoundError(f"Missing features file: {features_path}")
-    if not labels_path.exists():
-        raise FileNotFoundError(f"Missing labels file: {labels_path}")
-
-    df_features = pd.read_hdf(features_path, key="features")
-    df_labels = pd.read_hdf(labels_path, key="labels")
-    return df_features.merge(df_labels, on=["game_id", "action_id"], how="inner")
-
-
-def resolve_dataset_keys(
-    available_dataset_keys: list[str],
-    competition_prefixes: list[str],
-    season_suffixes: list[str] | None = None,
-) -> list[str]:
-    keys = [
-        k
-        for k in available_dataset_keys
-        if any(k.startswith(prefix + "_") for prefix in competition_prefixes)
-    ]
-    if season_suffixes:
-        keys = [k for k in keys if any(k.endswith(suffix) for suffix in season_suffixes)]
-    return sorted(keys)
+    with pd.HDFStore(str(data_file), mode="r") as store:
+        available_keys = set(store.keys())
+        selected_key = None
+        for key in key_candidates:
+            key_with_slash = f"/{key}"
+            if key_with_slash in available_keys:
+                selected_key = key
+                break
+        if selected_key is None:
+            raise KeyError(
+                f"None of keys {key_candidates} found in {data_file}. "
+                f"Available keys: {sorted(available_keys)}"
+            )
+        print(f"Using H5 key '{selected_key}' from {data_file}")
+        return store.get(f"/{selected_key}")
 
 
-def load_xy(
-    dataset_keys: list[str],
+def load_xy_from_rich_actions(
     target_col: str,
-    data_dir: Path,
-    val_pct: float = 0.2,
-    random_state: int = 42,
-) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.Series]:
-    """
-    Load and split multiple datasets into train/val based on unique game identifiers.
-    This prevents leakage of actions from the same game across splits.
-    """
+    data_file: Path,
+    key_candidates: list[str],
+    validation_competitions: list[str],
+    test_competitions: list[str],
+    train_competitions: list[str] | None = None,
+) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.Series, pd.DataFrame, pd.Series, list[str], list[str], list[str]]:
     if target_col not in {"scores", "concedes"}:
         raise ValueError("target_col must be 'scores' or 'concedes'")
-    if not (0 <= val_pct < 1):
-        raise ValueError("val_pct must be in [0, 1)")
-    if not dataset_keys:
-        raise ValueError("dataset_keys is empty")
 
-    frames: list[pd.DataFrame] = []
-    for dataset_key in dataset_keys:
-        df_part = _read_dataset(dataset_key=dataset_key, data_dir=data_dir).copy()
-        df_part["__dataset_key"] = dataset_key
-        frames.append(df_part)
-    df = pd.concat(frames, ignore_index=True)
+    df = _read_rich_actions(data_file=data_file, key_candidates=key_candidates).copy()
+    if "competition_name" not in df.columns:
+        raise KeyError("Expected 'competition_name' column in rich actions dataset")
 
+    df["competition_name"] = df["competition_name"].astype(str)
+    all_competitions = sorted(df["competition_name"].dropna().unique().tolist())
+
+    val_set = set(validation_competitions)
+    test_set = set(test_competitions)
+    if train_competitions is None:
+        train_set = set(all_competitions) - val_set - test_set
+    else:
+        train_set = set(train_competitions)
+
+    overlap = (train_set & val_set) | (train_set & test_set) | (val_set & test_set)
+    if overlap:
+        raise ValueError(f"Train/val/test competition sets overlap: {sorted(overlap)}")
+
+    df_train = df[df["competition_name"].isin(train_set)].copy()
+    df_val = df[df["competition_name"].isin(val_set)].copy()
+    df_test = df[df["competition_name"].isin(test_set)].copy()
+
+    if df_train.empty:
+        raise ValueError("Train split is empty after applying competition filters")
+    if df_val.empty:
+        raise ValueError("Validation split is empty after applying competition filters")
+    if df_test.empty:
+        raise ValueError("Test split is empty after applying competition filters")
+
+    excluded_cols = {"game_id", "action_id", "scores", "concedes", "competition_name"}
     feature_cols = [
         col
-        for col in df.columns
-        if col not in {"game_id", "action_id", "scores", "concedes", "__dataset_key"}
+        for col in df.select_dtypes(include=[np.number, bool]).columns
+        if col not in excluded_cols
     ]
-
-    split_game_key = df["__dataset_key"].astype(str) + "::" + df["game_id"].astype(str)
-    game_ids = np.array(sorted(split_game_key.unique()))
-    rng = np.random.default_rng(random_state)
-    rng.shuffle(game_ids)
-
-    n_val_games = int(round(len(game_ids) * val_pct))
-    val_game_ids = set(game_ids[:n_val_games])
-    print(f"Total games: {len(game_ids)}, Validation games: {n_val_games}")
-
-    is_val = split_game_key.isin(val_game_ids)
-    df_train = df.loc[~is_val].copy()
-    df_val = df.loc[is_val].copy()
+    if not feature_cols:
+        raise ValueError("No numeric feature columns available in rich actions dataset")
 
     X_train = df_train[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0)
     y_train = df_train[target_col].astype(int)
@@ -242,28 +229,20 @@ def load_xy(
     X_val = df_val[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0)
     y_val = df_val[target_col].astype(int)
 
-    return X_train, y_train, X_val, y_val
+    X_test = df_test[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0)
+    y_test = df_test[target_col].astype(int)
 
-
-def load_xy_all(
-    dataset_keys: list[str],
-    target_col: str,
-    data_dir: Path,
-) -> tuple[pd.DataFrame, pd.Series]:
-    if not dataset_keys:
-        raise ValueError("dataset_keys is empty")
-    frames: list[pd.DataFrame] = []
-    for dataset_key in dataset_keys:
-        frames.append(_read_dataset(dataset_key=dataset_key, data_dir=data_dir))
-    df = pd.concat(frames, ignore_index=True)
-    feature_cols = [
-        col
-        for col in df.columns
-        if col not in {"game_id", "action_id", "scores", "concedes"}
-    ]
-    X = df[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0)
-    y = df[target_col].astype(int)
-    return X, y
+    return (
+        X_train,
+        y_train,
+        X_val,
+        y_val,
+        X_test,
+        y_test,
+        sorted(train_set),
+        sorted(val_set),
+        sorted(test_set),
+    )
 
 
 def build_eval_set(
@@ -391,37 +370,31 @@ def plot_confusion_matrix(cm, split_name):
     print(f"TP: {tp}, TN: {tn}, FP: {fp}, FN: {fn}")
 
 def main() -> int:
-    if not DATA_DIR.exists():
-        raise FileNotFoundError(f"DATA_DIR does not exist: {DATA_DIR.resolve()}")
-
-    available_dataset_keys = list_available_dataset_keys(DATA_DIR)
-    train_keys = resolve_dataset_keys(
-        available_dataset_keys=available_dataset_keys,
-        competition_prefixes=TRAIN_COMPETITION_PREFIXES,
-        season_suffixes=TRAIN_SEASON_SUFFIXES,
-    )
-    test_keys = resolve_dataset_keys(
-        available_dataset_keys=available_dataset_keys,
-        competition_prefixes=TEST_COMPETITION_PREFIXES,
-        season_suffixes=TEST_SEASON_SUFFIXES,
-    )
-    if not train_keys:
-        raise ValueError("No train datasets resolved from TRAIN_COMPETITION_PREFIXES/SEASON_SUFFIXES")
-    if not test_keys:
-        raise ValueError("No test datasets resolved from TEST_COMPETITION_PREFIXES/SEASON_SUFFIXES")
-
-    X_train, y_train, X_val, y_val = load_xy(
-        dataset_keys=train_keys,
+    (
+        X_train,
+        y_train,
+        X_val,
+        y_val,
+        X_test,
+        y_test,
+        train_competitions_used,
+        val_competitions_used,
+        test_competitions_used,
+    ) = load_xy_from_rich_actions(
         target_col=TARGET_COL,
-        data_dir=DATA_DIR,
-        val_pct=VAL_PCT,
-        random_state=RANDOM_STATE,
+        data_file=DATA_FILE,
+        key_candidates=RICH_ACTIONS_KEYS,
+        validation_competitions=VALIDATION_COMPETITIONS,
+        test_competitions=TEST_COMPETITIONS,
+        train_competitions=TRAIN_COMPETITIONS,
     )
 
     X_train = X_train.astype(np.float32)
     X_val = X_val.astype(np.float32)
+    X_test = X_test.astype(np.float32)
     y_train = y_train.astype(np.uint8)
     y_val = y_val.astype(np.uint8)
+    y_test = y_test.astype(np.uint8)
 
     train_feature_cols = list(X_train.columns)
 
@@ -444,20 +417,13 @@ def main() -> int:
     print("Target:", TARGET_COL)
     print("Objective:", XGB_MODEL_CONFIG.get("objective"))
     print("Eval metric:", XGB_MODEL_CONFIG.get("eval_metric"))
-    print("Train datasets:", len(train_keys), train_keys[:10], "..." if len(train_keys) > 10 else "")
+    print("Train competitions:", len(train_competitions_used), train_competitions_used)
+    print("Validation competitions:", len(val_competitions_used), val_competitions_used)
+    print("Test competitions:", len(test_competitions_used), test_competitions_used)
     print("Validation mode:", eval_set_name)
-    print("Test datasets:", len(test_keys), test_keys[:10], "..." if len(test_keys) > 10 else "")
-    print("Validation pct (game split):", VAL_PCT)
 
     model.fit(X_train, y_train, **fit_kwargs)
-
-    X_test, y_test = load_xy_all(
-        dataset_keys=test_keys,
-        target_col=TARGET_COL,
-        data_dir=DATA_DIR,
-    )
-    X_test = X_test.astype(np.float32).reindex(columns=train_feature_cols, fill_value=0)
-    y_test = y_test.astype(np.uint8)
+    X_test = X_test.reindex(columns=train_feature_cols, fill_value=0)
 
     X_val_eval = X_val.reindex(columns=train_feature_cols, fill_value=0)
 
@@ -517,12 +483,12 @@ def main() -> int:
             "target": [TARGET_COL],
             "objective": [XGB_MODEL_CONFIG.get("objective")],
             "eval_metric": [str(XGB_MODEL_CONFIG.get("eval_metric"))],
-            "train_dataset_group": [str(TRAIN_COMPETITION_PREFIXES)],
-            "test_dataset_group": [str(TEST_COMPETITION_PREFIXES)],
-            "train_dataset_keys": [str(train_keys)],
-            "test_dataset_keys": [str(test_keys)],
+            "train_dataset_group": [str(train_competitions_used)],
+            "validation_dataset_group": [str(val_competitions_used)],
+            "test_dataset_group": [str(test_competitions_used)],
+            "data_file": [str(DATA_FILE)],
+            "h5_key_candidates": [str(RICH_ACTIONS_KEYS)],
             "validation_set_mode": [eval_set_name],
-            "val_pct": [VAL_PCT],
             "random_state": [RANDOM_STATE],
             "pred_threshold": [PRED_THRESHOLD],
             "selected_threshold": [selected_threshold],
@@ -536,12 +502,12 @@ def main() -> int:
 
     # FOR INTERACTIVE DEBUGGING/RESULTS EXPLORATION
     # Filter to rows where model predicted goal (probability = 1)
-    goals_mask = y_proba_test >= selected_threshold
-    X_test_goals = X_test[goals_mask]
+    # goals_mask = y_proba_test >= selected_threshold
+    # X_test_goals = X_test[goals_mask]
     
-    # Keep only columns with variance (exclude constant columns)
-    relevant_cols = [col for col in X_test_goals.columns if X_test_goals[col].nunique() > 1]
-    X_test_goals[relevant_cols].to_csv(RESULTS_PATH / f"predicted_goals_{TARGET_COL}.csv", index=False)
+    # # Keep only columns with variance (exclude constant columns)
+    # relevant_cols = [col for col in X_test_goals.columns if X_test_goals[col].nunique() > 1]
+    # X_test_goals[relevant_cols].to_csv(RESULTS_PATH / f"predicted_goals_{TARGET_COL}.csv", index=False)
 
     return 0
 
