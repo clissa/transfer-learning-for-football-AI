@@ -678,6 +678,266 @@ def load_xy_competition_split(
         sorted(train_set), sorted(val_set), sorted(test_set),
     )
 
+
+def load_xy_source_calib_target_split(
+    target_col: str,
+    data_file: str | Path,
+    key_candidates: Sequence[str],
+    source_competitions: Sequence[str],
+    calib_competitions: Sequence[str],
+    target_competitions: Sequence[str],
+    validation_frac: float = 0.2,
+    random_state: int = 42,
+) -> tuple[
+    pd.DataFrame, pd.Series,
+    pd.DataFrame, pd.Series,
+    pd.DataFrame, pd.Series,
+    pd.DataFrame, pd.Series,
+    list[str], list[str], list[str],
+]:
+    """Load data and split source into train/validation by match (stratified by league).
+
+    This function:
+    1. Loads source (train), calib (val), target (test) data by competition splits
+    2. Splits source into train (1-validation_frac) and validation (validation_frac)
+       by sampling matches, stratified by competition (league)
+
+    Args:
+        target_col: ``'scores'`` or ``'concedes'``.
+        data_file: HDF5 file with a merged actions table.
+        key_candidates: HDF5 keys to try (first match wins).
+        source_competitions: Competition names for source (to be split into train/val).
+        calib_competitions: Competition names for calibration (unused in training).
+        target_competitions: Competition names for target (0-shot evaluation).
+        validation_frac: Fraction of source matches to use for validation (default 0.2).
+        random_state: Random seed for stratified match sampling.
+
+    Returns:
+        ``(X_train, y_train, X_val, y_val, X_calib, y_calib, X_target, y_target,
+          source_comps, calib_comps, target_comps)``
+    """
+    if target_col not in {"scores", "concedes"}:
+        raise ValueError("target_col must be 'scores' or 'concedes'")
+
+    df = read_h5_table(data_file=data_file, key_candidates=key_candidates).copy()
+    if "competition_name" not in df.columns:
+        raise KeyError("Expected 'competition_name' column in dataset")
+    if "game_id" not in df.columns:
+        raise KeyError("Expected 'game_id' column in dataset")
+
+    df["competition_name"] = df["competition_name"].astype(str)
+
+    source_set = set(source_competitions)
+    calib_set = set(calib_competitions)
+    target_set = set(target_competitions)
+
+    overlap = (source_set & calib_set) | (source_set & target_set) | (calib_set & target_set)
+    if overlap:
+        raise ValueError(f"Source/calib/target competition sets overlap: {sorted(overlap)}")
+
+    # Extract splits
+    df_source = df[df["competition_name"].isin(source_set)].copy()
+    df_calib = df[df["competition_name"].isin(calib_set)].copy()
+    df_target = df[df["competition_name"].isin(target_set)].copy()
+
+    if df_source.empty:
+        raise ValueError("Source split is empty after applying competition filters")
+    if df_calib.empty:
+        raise ValueError("Calib split is empty after applying competition filters")
+    if df_target.empty:
+        raise ValueError("Target split is empty after applying competition filters")
+
+    # Split source by matches (game_id), stratified by competition_name
+    # Build a match-level DataFrame with competition as stratification variable
+    source_matches = (
+        df_source[["game_id", "competition_name"]]
+        .drop_duplicates(subset=["game_id"])
+        .reset_index(drop=True)
+    )
+
+    # Perform stratified split at the match level
+    train_matches, val_matches = train_test_split(
+        source_matches,
+        test_size=validation_frac,
+        stratify=source_matches["competition_name"],
+        random_state=random_state,
+    )
+
+    train_game_ids = set(train_matches["game_id"])
+    val_game_ids = set(val_matches["game_id"])
+
+    df_train = df_source[df_source["game_id"].isin(train_game_ids)].copy()
+    df_val = df_source[df_source["game_id"].isin(val_game_ids)].copy()
+
+    if df_train.empty:
+        raise ValueError("Train split is empty after match sampling")
+    if df_val.empty:
+        raise ValueError("Validation split is empty after match sampling")
+
+    # Extract features — use curated VAEP whitelist to drop redundant raw-ID columns
+    feature_cols = select_vaep_feature_cols(df.columns)
+
+    X_train = df_train[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0)
+    y_train = df_train[target_col].astype(int)
+    X_val = df_val[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0)
+    y_val = df_val[target_col].astype(int)
+    X_calib = df_calib[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0)
+    y_calib = df_calib[target_col].astype(int)
+    X_target = df_target[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0)
+    y_target = df_target[target_col].astype(int)
+
+    return (
+        X_train, y_train,
+        X_val, y_val,
+        X_calib, y_calib,
+        X_target, y_target,
+        sorted(source_set), sorted(calib_set), sorted(target_set),
+    )
+
+
+# ──────────────────────────────────────────────
+# Few-shot / transfer-learning helpers
+# ──────────────────────────────────────────────
+
+
+def load_fewshot_splits(
+    target_col: str,
+    data_file: str | Path,
+    key_candidates: Sequence[str],
+    source_competitions: Sequence[str],
+    target_competitions: Sequence[str],
+    validation_frac: float = 0.2,
+    random_state: int = 42,
+) -> tuple[
+    pd.DataFrame, pd.Series,
+    pd.DataFrame, pd.Series,
+    pd.DataFrame, pd.Series,
+    pd.Series,
+    list[str],
+]:
+    """Load data for few-shot transfer experiments.
+
+    Splits by competition into source and target, then splits source into
+    train/val by ``game_id`` (stratified by league).  Returns ``game_id``
+    alongside the target arrays so the caller can sub-sample games without
+    leakage.  ``game_id`` is **never** included in feature columns.
+
+    Args:
+        target_col: ``'scores'`` or ``'concedes'``.
+        data_file: HDF5 file with a merged actions table.
+        key_candidates: HDF5 keys to try (first match wins).
+        source_competitions: Competition names used for source training.
+        target_competitions: Competition names for the target domain.
+        validation_frac: Fraction of source matches held out for validation.
+        random_state: Random seed for the source train/val split.
+
+    Returns:
+        ``(X_source_train, y_source_train,
+          X_source_val, y_source_val,
+          X_target, y_target,
+          target_game_ids,    # pd.Series aligned with X_target rows
+          feature_cols)``     # list[str] of feature column names
+    """
+    if target_col not in {"scores", "concedes"}:
+        raise ValueError("target_col must be 'scores' or 'concedes'")
+
+    df = read_h5_table(data_file=data_file, key_candidates=key_candidates).copy()
+    for col_name in ("competition_name", "game_id"):
+        if col_name not in df.columns:
+            raise KeyError(f"Expected '{col_name}' column in dataset")
+    df["competition_name"] = df["competition_name"].astype(str)
+
+    source_set = set(source_competitions)
+    target_set = set(target_competitions)
+    overlap = source_set & target_set
+    if overlap:
+        raise ValueError(f"Source/target competition sets overlap: {sorted(overlap)}")
+
+    df_source = df[df["competition_name"].isin(source_set)].copy()
+    df_target = df[df["competition_name"].isin(target_set)].copy()
+
+    if df_source.empty:
+        raise ValueError("Source split is empty after applying competition filters")
+    if df_target.empty:
+        raise ValueError("Target split is empty after applying competition filters")
+
+    # Split source by match, stratified by league
+    source_matches = (
+        df_source[["game_id", "competition_name"]]
+        .drop_duplicates(subset=["game_id"])
+        .reset_index(drop=True)
+    )
+    train_matches, val_matches = train_test_split(
+        source_matches,
+        test_size=validation_frac,
+        stratify=source_matches["competition_name"],
+        random_state=random_state,
+    )
+    df_train = df_source[df_source["game_id"].isin(set(train_matches["game_id"]))].copy()
+    df_val = df_source[df_source["game_id"].isin(set(val_matches["game_id"]))].copy()
+
+    # Feature columns — use curated VAEP whitelist (game_id never included)
+    feature_cols = select_vaep_feature_cols(df.columns)
+
+    def _xy(frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
+        X = frame[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0)
+        y = frame[target_col].astype(int)
+        return X, y
+
+    X_train, y_train = _xy(df_train)
+    X_val, y_val = _xy(df_val)
+    X_target, y_target = _xy(df_target)
+
+    # game_id Series aligned with X_target index
+    target_game_ids = df_target.loc[X_target.index, "game_id"]
+
+    return (
+        X_train, y_train,
+        X_val, y_val,
+        X_target, y_target,
+        target_game_ids,
+        feature_cols,
+    )
+
+
+def sample_target_games(
+    X_target: pd.DataFrame,
+    y_target: pd.Series,
+    target_game_ids: pd.Series,
+    frac: float,
+    random_state: int,
+) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.Series]:
+    """Sample a fraction of target *games* and split into few-shot / holdout.
+
+    Sampling is at the ``game_id`` level (not action level) to prevent
+    within-match leakage.
+
+    Args:
+        X_target: Feature DataFrame for the full target set.
+        y_target: Labels for the full target set.
+        target_game_ids: ``game_id`` Series aligned with ``X_target``.
+        frac: Fraction of unique games to sample (e.g. 0.01, 0.05, 0.20).
+        random_state: Random seed for reproducibility.
+
+    Returns:
+        ``(X_few, y_few, X_holdout, y_holdout)``
+    """
+    unique_games = target_game_ids.unique()
+    n_sample = max(1, int(round(len(unique_games) * frac)))
+    rng = np.random.RandomState(random_state)
+    sampled_games = set(rng.choice(unique_games, size=n_sample, replace=False))
+
+    few_mask = target_game_ids.isin(sampled_games)
+    holdout_mask = ~few_mask
+
+    return (
+        X_target.loc[few_mask].copy(),
+        y_target.loc[few_mask].copy(),
+        X_target.loc[holdout_mask].copy(),
+        y_target.loc[holdout_mask].copy(),
+    )
+
+
 # ──────────────────────────────────────────────
 # Model persistence
 # ──────────────────────────────────────────────
