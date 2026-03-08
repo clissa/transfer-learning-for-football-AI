@@ -547,3 +547,318 @@ def build_percentage_distribution(
     dist["pct_actions"] = (100 * dist["count_actions"] / total).round(4)
     return dist.sort_values("pct_actions", ascending=False)
 
+
+# ──────────────────────────────────────────────
+# EDA data-analysis helpers
+# ──────────────────────────────────────────────
+
+
+def classify_columns(
+    df: pd.DataFrame,
+    target_col: str,
+    known_id_cols: set[str] | None = None,
+    known_meta_cols: set[str] | None = None,
+    leakage_suspect_cols: set[str] | None = None,
+) -> dict[str, list[str]]:
+    """Classify DataFrame columns into semantic groups.
+
+    Args:
+        df: Input DataFrame.
+        target_col: Name of the target column.
+        known_id_cols: Column names to assign to the ``"id"`` group.
+        known_meta_cols: Column names to assign to the ``"meta"`` group.
+        leakage_suspect_cols: Column names to flag as leakage suspects.
+
+    Returns:
+        Dict with keys ``"id"``, ``"meta"``, ``"target"``,
+        ``"leakage_suspect"``, ``"numeric"``, ``"categorical"``,
+        ``"datetime"``, ``"bool"``.
+    """
+    known_id_cols = known_id_cols or set()
+    known_meta_cols = known_meta_cols or set()
+    leakage_suspect_cols = leakage_suspect_cols or set()
+
+    groups: dict[str, list[str]] = {
+        "id": [],
+        "meta": [],
+        "target": [],
+        "leakage_suspect": [],
+        "numeric": [],
+        "categorical": [],
+        "datetime": [],
+        "bool": [],
+    }
+    for col in df.columns:
+        if col == target_col:
+            groups["target"].append(col)
+        elif col in known_id_cols:
+            groups["id"].append(col)
+        elif col in known_meta_cols:
+            groups["meta"].append(col)
+        elif col in leakage_suspect_cols:
+            groups["leakage_suspect"].append(col)
+        elif pd.api.types.is_datetime64_any_dtype(df[col]):
+            groups["datetime"].append(col)
+        elif pd.api.types.is_bool_dtype(df[col]):
+            groups["bool"].append(col)
+        elif pd.api.types.is_numeric_dtype(df[col]):
+            groups["numeric"].append(col)
+        else:
+            groups["categorical"].append(col)
+    return groups
+
+
+def compute_data_quality(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute per-column data-quality audit.
+
+    Args:
+        df: Input DataFrame.
+
+    Returns:
+        DataFrame with columns: ``column``, ``dtype``, ``n_missing``,
+        ``pct_missing``, ``n_unique``, ``is_constant``, ``example_values``.
+    """
+    records = []
+    for col in df.columns:
+        s = df[col]
+        n_miss = int(s.isna().sum())
+        n_unique = int(s.nunique(dropna=True))
+        records.append(
+            {
+                "column": col,
+                "dtype": str(s.dtype),
+                "n_missing": n_miss,
+                "pct_missing": round(100 * n_miss / max(len(df), 1), 2),
+                "n_unique": n_unique,
+                "is_constant": n_unique <= 1,
+                "example_values": str(s.dropna().unique()[:5].tolist()),
+            }
+        )
+    return pd.DataFrame(records).sort_values("pct_missing", ascending=False)
+
+
+def compute_missingness(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute per-column missing-value percentages.
+
+    Args:
+        df: Input DataFrame.
+
+    Returns:
+        DataFrame with ``column`` and ``pct_missing`` for columns with
+        any missing values, or an empty DataFrame if none.
+    """
+    miss = df.isnull().mean().sort_values(ascending=False)
+    miss = miss[miss > 0]
+    if miss.empty:
+        return pd.DataFrame(columns=["column", "pct_missing"])
+    result = miss.reset_index()
+    result.columns = ["column", "pct_missing"]
+    result["pct_missing"] = (result["pct_missing"] * 100).round(2)
+    return result
+
+
+def detect_leakage_suspects(
+    df: pd.DataFrame,
+    target_col: str,
+    leakage_suspect_cols: set[str],
+    numeric_feature_cols: list[str],
+    corr_threshold: float = 0.5,
+) -> list[dict[str, Any]]:
+    """Detect columns suspected of target leakage.
+
+    Checks known suspect columns and any numeric feature with
+    |correlation| > *corr_threshold*.
+
+    Args:
+        df: Input DataFrame.
+        target_col: Target column name.
+        leakage_suspect_cols: Column names known to be suspects.
+        numeric_feature_cols: Numeric feature column names to scan.
+        corr_threshold: Absolute correlation threshold.
+
+    Returns:
+        List of dicts with ``column``, ``reason``, ``corr_with_target``.
+    """
+    y_float = df[target_col].astype(float)
+    suspects: list[dict[str, Any]] = []
+
+    for col in leakage_suspect_cols:
+        if col == target_col or col not in df.columns:
+            continue
+        s = df[col]
+        if pd.api.types.is_numeric_dtype(s) or pd.api.types.is_bool_dtype(s):
+            corr = y_float.corr(s.astype(float))
+            suspects.append(
+                {"column": col, "reason": "known_suspect", "corr_with_target": round(corr, 4)}
+            )
+
+    for col in numeric_feature_cols:
+        if col not in df.columns:
+            continue
+        corr = y_float.corr(df[col].astype(float))
+        if abs(corr) > corr_threshold:
+            suspects.append(
+                {"column": col, "reason": "high_corr_with_target", "corr_with_target": round(corr, 4)}
+            )
+
+    return suspects
+
+
+def build_zone_metrics_for_coordinates(
+    df_styles: pd.DataFrame,
+    x_col: str,
+    y_col: str,
+    x_edges: np.ndarray,
+    y_edges: np.ndarray,
+) -> pd.DataFrame:
+    """Aggregate action metrics into spatial zones defined by coordinate bins.
+
+    Args:
+        df_styles: Style DataFrame (must contain *x_col*, *y_col*,
+            ``result``, ``scores``, ``distance``).
+        x_col: Column for x-coordinate (e.g. ``"start_x"``).
+        y_col: Column for y-coordinate (e.g. ``"start_y"``).
+        x_edges: Bin edges along x-axis.
+        y_edges: Bin edges along y-axis.
+
+    Returns:
+        DataFrame with one row per zone, including ``count_actions``,
+        ``success_rate_pct``, ``score_rate_pct``, ``mean_distance``, etc.
+    """
+    full_idx = pd.MultiIndex.from_product(
+        [range(len(y_edges) - 1), range(len(x_edges) - 1)],
+        names=["y_zone_idx", "x_zone_idx"],
+    )
+
+    if len(df_styles) == 0:
+        zone_rows = pd.DataFrame(index=full_idx).reset_index()
+        zone_rows["count_actions"] = 0
+        zone_rows["n_success"] = 0
+        zone_rows["n_scores"] = 0
+        zone_rows["success_rate_pct"] = np.nan
+        zone_rows["score_rate_pct"] = np.nan
+        zone_rows["mean_distance"] = np.nan
+        zone_rows["pct_actions"] = 0.0
+    else:
+        x_upper = np.nextafter(x_edges[-1], x_edges[0])
+        y_upper = np.nextafter(y_edges[-1], y_edges[0])
+
+        coords = df_styles[[x_col, y_col, "result", "scores", "distance"]].copy()
+        coords[x_col] = pd.to_numeric(coords[x_col], errors="coerce").clip(
+            lower=x_edges[0], upper=x_upper
+        )
+        coords[y_col] = pd.to_numeric(coords[y_col], errors="coerce").clip(
+            lower=y_edges[0], upper=y_upper
+        )
+        coords["is_success"] = coords["result"].astype(str).str.casefold().eq("success")
+        coords["is_score"] = (
+            pd.to_numeric(coords["scores"], errors="coerce").fillna(0).astype(float) > 0
+        )
+        coords["x_zone_idx"] = pd.cut(
+            coords[x_col], bins=x_edges, labels=False, include_lowest=True, right=False
+        )
+        coords["y_zone_idx"] = pd.cut(
+            coords[y_col], bins=y_edges, labels=False, include_lowest=True, right=False
+        )
+        valid = coords.dropna(subset=["x_zone_idx", "y_zone_idx"]).copy()
+        valid["x_zone_idx"] = valid["x_zone_idx"].astype(int)
+        valid["y_zone_idx"] = valid["y_zone_idx"].astype(int)
+
+        grouped = valid.groupby(["y_zone_idx", "x_zone_idx"], dropna=False).agg(
+            count_actions=("is_success", "size"),
+            n_success=("is_success", "sum"),
+            n_scores=("is_score", "sum"),
+            success_rate=("is_success", "mean"),
+            score_rate=("is_score", "mean"),
+            mean_distance=("distance", "mean"),
+        )
+        zone_rows = grouped.reindex(full_idx).reset_index()
+        zone_rows["count_actions"] = zone_rows["count_actions"].fillna(0).astype(int)
+        zone_rows["n_success"] = zone_rows["n_success"].fillna(0).astype(int)
+        zone_rows["n_scores"] = zone_rows["n_scores"].fillna(0).astype(int)
+        zone_rows["success_rate_pct"] = (100 * zone_rows["success_rate"]).round(4)
+        zone_rows["score_rate_pct"] = (100 * zone_rows["score_rate"]).round(4)
+        zone_rows = zone_rows.drop(columns=["success_rate", "score_rate"])
+        zone_rows["pct_actions"] = (
+            100 * zone_rows["count_actions"] / max(len(df_styles), 1)
+        ).round(4)
+
+    zone_rows["x_min"] = zone_rows["x_zone_idx"].map(lambda idx: float(x_edges[idx]))
+    zone_rows["x_max"] = zone_rows["x_zone_idx"].map(lambda idx: float(x_edges[idx + 1]))
+    zone_rows["y_min"] = zone_rows["y_zone_idx"].map(lambda idx: float(y_edges[idx]))
+    zone_rows["y_max"] = zone_rows["y_zone_idx"].map(lambda idx: float(y_edges[idx + 1]))
+    return zone_rows
+
+
+# ──────────────────────────────────────────────
+# Internal helpers
+# ──────────────────────────────────────────────
+
+
+def _as_series(obj: pd.Series | pd.DataFrame, name: str) -> pd.Series:
+    """Compatibility shim: socceraction labels may return Series or 1-col DataFrame."""
+    if isinstance(obj, pd.DataFrame):
+        if name in obj.columns and obj.shape[1] == 1:
+            series = obj[name]
+        elif obj.shape[1] == 1:
+            series = obj.iloc[:, 0]
+        else:
+            series = obj.iloc[:, 0]
+    else:
+        series = obj
+    return series.rename(name)
+
+
+def _competition_row(
+    competitions_df: pd.DataFrame,
+    competition_id: int,
+    season_id: int,
+) -> pd.Series:
+    row = competitions_df[
+        (competitions_df.competition_id == competition_id)
+        & (competitions_df.season_id == season_id)
+    ]
+    if len(row) != 1:
+        raise ValueError(
+            f"Cannot uniquely resolve competition_id={competition_id}, season_id={season_id}"
+        )
+    return row.iloc[0]
+
+
+def _ensure_cols_from_index(df: pd.DataFrame, required_cols: list[str]) -> pd.DataFrame:
+    """Reset index if required columns are missing from columns (but present in index)."""
+    if not set(required_cols).issubset(df.columns):
+        df = df.reset_index()
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise KeyError(f"Missing required columns {missing}. Available: {list(df.columns)}")
+    return df
+
+
+def _drop_overlaps(
+    right: pd.DataFrame, left_cols: pd.Index, join_keys: set[str]
+) -> pd.DataFrame:
+    """Drop columns from *right* that already exist in *left_cols* (except join keys)."""
+    overlaps = (set(right.columns) & set(left_cols)) - join_keys
+    if overlaps:
+        right = right.drop(columns=sorted(overlaps))
+    return right
+
+
+def _stringify_for_hdf(
+    df_games: pd.DataFrame, df_players: pd.DataFrame
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Cast problematic object columns to str so HDF5 serialisation works."""
+    games = df_games.copy()
+    players = df_players.copy()
+
+    for col in ["competition_stage", "venue", "referee"]:
+        if col in games.columns:
+            games[col] = games[col].fillna("").astype(str)
+
+    for col in ["player_name", "nickname", "starting_position_name"]:
+        if col in players.columns:
+            players[col] = players[col].fillna("").astype(str)
+
+    return games, players
+
