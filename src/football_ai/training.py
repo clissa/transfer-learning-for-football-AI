@@ -141,6 +141,310 @@ def drop_none_params(d: dict[str, Any]) -> dict[str, Any]:
     """Remove keys whose value is ``None`` (handy for sklearn / xgboost param dicts)."""
     return {k: v for k, v in d.items() if v is not None}
 
+
+# ──────────────────────────────────────────────
+# Custom XGBoost eval metrics
+# ──────────────────────────────────────────────
+# XGBoost's C++ engine supports only a fixed set of built-in metrics.
+# Metrics like "recall" must be provided as Python callables.
+# For the sklearn API (XGBClassifier), the callable signature is:
+#     (y_true: np.ndarray, y_score: np.ndarray) -> float
+# and the metric name is taken from ``func.__name__``.
+#
+# IMPORTANT: XGBoost ≤ 3.2 only supports **one** custom callable in
+# ``eval_metric``.  When the user requests multiple custom metrics,
+# we bundle them into a single "composite" callable (which returns the
+# last custom metric's value for early-stopping) plus a companion
+# ``TrainingCallback`` that injects the remaining metric values into
+# ``evals_log`` so they appear in ``model.evals_result()``.
+
+from xgboost.callback import TrainingCallback
+
+# Built-in metric names recognised by XGBoost's C++ engine.
+_XGB_BUILTIN_METRICS: frozenset[str] = frozenset({
+    "rmse", "rmsle", "mae", "mape", "mphe", "logloss", "error",
+    "merror", "mlogloss", "auc", "aucpr", "ndcg", "map",
+    "pre", "gamma-nloglik", "gamma-deviance", "poisson-nloglik",
+    "tweedie-nloglik", "tweedie-nloglik@1.5", "cox-nloglik",
+    "aft-nloglik", "interval-regression-accuracy",
+})
+
+
+# ── Individual custom metric functions ──────────────────────────────────────
+
+def _xgb_recall(y_true: np.ndarray, y_score: np.ndarray) -> float:
+    """Recall = TP / (TP + FN).  Threshold at 0.5 on predicted probabilities."""
+    y_hat = (np.asarray(y_score) > 0.5).astype(int)
+    y_t = np.asarray(y_true).astype(int)
+    tp = int(((y_hat == 1) & (y_t == 1)).sum())
+    p = int((y_t == 1).sum())
+    return float(tp / p) if p > 0 else 0.0
+
+
+def _xgb_precision(y_true: np.ndarray, y_score: np.ndarray) -> float:
+    """Precision = TP / (TP + FP).  Threshold at 0.5 on predicted probabilities."""
+    y_hat = (np.asarray(y_score) > 0.5).astype(int)
+    y_t = np.asarray(y_true).astype(int)
+    tp = int(((y_hat == 1) & (y_t == 1)).sum())
+    pp = int((y_hat == 1).sum())
+    return float(tp / pp) if pp > 0 else 0.0
+
+
+def _xgb_f1(y_true: np.ndarray, y_score: np.ndarray) -> float:
+    """F1 = 2 * precision * recall / (precision + recall).  Threshold at 0.5."""
+    y_hat = (np.asarray(y_score) > 0.5).astype(int)
+    y_t = np.asarray(y_true).astype(int)
+    tp = int(((y_hat == 1) & (y_t == 1)).sum())
+    pp = int((y_hat == 1).sum())  # predicted positives
+    p = int((y_t == 1).sum())     # actual positives
+    prec = tp / pp if pp > 0 else 0.0
+    rec = tp / p if p > 0 else 0.0
+    return float(2 * prec * rec / (prec + rec)) if (prec + rec) > 0 else 0.0
+
+
+# Give them clean names that XGBoost will log in eval output.
+_xgb_recall.__name__ = "recall"
+_xgb_precision.__name__ = "precision"
+_xgb_f1.__name__ = "f1"
+
+# Registry: maps YAML-friendly string names to callables.
+_CUSTOM_XGB_METRICS: dict[str, Any] = {
+    "recall": _xgb_recall,
+    "precision": _xgb_precision,
+    "f1": _xgb_f1,
+}
+
+# Custom metrics that should be *maximized* for early stopping.
+# (All current custom metrics are higher-is-better.)
+_CUSTOM_METRICS_MAXIMIZE: frozenset[str] = frozenset({
+    "recall", "precision", "f1",
+})
+
+# Built-in XGBoost metrics that should be maximized.
+_BUILTIN_METRICS_MAXIMIZE: frozenset[str] = frozenset({
+    "auc", "aucpr", "ndcg", "map", "pre",
+})
+
+
+# ── Composite callable + callback for multiple custom metrics ───────────────
+
+def _make_composite_xgb_metric(
+    custom_names: list[str],
+) -> tuple[Any, TrainingCallback]:
+    """Bundle several custom metrics into one callable + companion callback.
+
+    XGBoost only accepts **one** custom callable in ``eval_metric``.
+    This function creates:
+
+    * A *composite callable* that computes **all** requested custom metrics,
+      stores them in a shared buffer, and **returns** the value of the
+      **last** metric (which drives early-stopping).
+    * A lightweight :class:`TrainingCallback` that, after each boosting
+      round, injects the "extra" metric values into ``evals_log`` so they
+      appear in ``model.evals_result()``.
+
+    Args:
+        custom_names: Ordered list of custom metric names (e.g.
+            ``["precision", "recall", "f1"]``).
+
+    Returns:
+        ``(composite_callable, companion_callback)``
+    """
+    fns = [(name, _CUSTOM_XGB_METRICS[name]) for name in custom_names]
+    early_stop_name = custom_names[-1]
+    extra_names = custom_names[:-1]
+
+    # Shared buffer: list of per-eval-set dicts within the current round.
+    # The callable appends one dict per call; the callback reads & resets.
+    _round_buffer: list[dict[str, float]] = []
+
+    def composite(y_true: np.ndarray, y_score: np.ndarray) -> float:
+        values: dict[str, float] = {}
+        for name, fn in fns:
+            values[name] = fn(y_true, y_score)
+        _round_buffer.append(values)
+        return values[early_stop_name]
+
+    composite.__name__ = early_stop_name
+
+    class _ExtraMetricsInjector(TrainingCallback):
+        """Inject extra custom metric values into *evals_log*.
+
+        Must be placed **before** ``EarlyStopping`` in the callback list
+        (the default when passed via ``XGBClassifier(callbacks=[...])``)
+        so that early-stopping can also see the injected metrics.
+        """
+
+        def after_iteration(
+            self,
+            model: Any,
+            epoch: int,
+            evals_log: dict[str, dict[str, list[float]]],
+        ) -> bool:
+            eval_keys = list(evals_log.keys())
+            for i, eval_key in enumerate(eval_keys):
+                if i < len(_round_buffer):
+                    vals = _round_buffer[i]
+                    for name in extra_names:
+                        evals_log[eval_key].setdefault(name, []).append(
+                            vals.get(name, 0.0)
+                        )
+            _round_buffer.clear()
+            return False  # never request stopping
+
+    return composite, _ExtraMetricsInjector()
+
+
+# ── Public resolver ─────────────────────────────────────────────────────────
+
+def resolve_xgb_eval_metrics(
+    eval_metric: str | list[str] | None,
+    early_stopping_rounds: int | None = None,
+    early_stopping_metric: str | None = None,
+) -> tuple[list[str | Any] | None, list[Any], int | None]:
+    """Replace non-built-in metric names with callable implementations.
+
+    Because XGBoost (≤ 3.2) only allows **one** custom callable in
+    ``eval_metric``, this function bundles multiple custom metrics into a
+    single composite callable and returns a companion callback list that
+    must be prepended to the model's ``callbacks`` parameter.
+
+    When the early-stopping metric requires maximisation (or is not the
+    default last-in-list metric), this function injects an explicit
+    ``xgboost.callback.EarlyStopping`` callback and returns
+    ``early_stopping_rounds_out = None`` so that the caller **removes**
+    the ``early_stopping_rounds`` constructor parameter (which would
+    create a *second*, conflicting ``EarlyStopping`` callback).
+
+    Args:
+        eval_metric: The ``eval_metric`` value from config (string, list,
+            or *None*).
+        early_stopping_rounds: The early-stopping patience from config.
+            Needed to build the explicit ``EarlyStopping`` callback when
+            the last metric must be maximised.
+        early_stopping_metric: Name of the metric to use for early
+            stopping.  If *None*, XGBoost's default (last metric in
+            ``eval_metric``) is used.  When set, an explicit
+            ``EarlyStopping(metric_name=...)`` callback is always
+            injected so the stopping metric is independent of the
+            ``eval_metric`` order.
+
+    Returns:
+        ``(resolved_metrics, extra_callbacks, early_stopping_rounds_out)``
+        where:
+
+        * *resolved_metrics* – list to pass as ``eval_metric``.
+        * *extra_callbacks* – (possibly empty) list of callbacks to
+          **prepend** to the model's ``callbacks``.
+        * *early_stopping_rounds_out* – the value to set on the model's
+          ``early_stopping_rounds`` parameter.  ``None`` means *"do not
+          pass it; the explicit callback handles stopping"*.
+
+    Raises:
+        ValueError: If an unknown custom metric name is requested.
+    """
+    if eval_metric is None:
+        return None, [], early_stopping_rounds
+
+    if isinstance(eval_metric, str):
+        eval_metric = [eval_metric]
+
+    # Separate built-in from custom, preserving order.
+    builtin: list[str] = []
+    custom_names: list[str] = []
+    for m in eval_metric:
+        if not isinstance(m, str):
+            raise TypeError(f"eval_metric entries must be strings, got {type(m)}")
+        if m in _XGB_BUILTIN_METRICS:
+            builtin.append(m)
+        elif m in _CUSTOM_XGB_METRICS:
+            custom_names.append(m)
+        else:
+            raise ValueError(
+                f"Unknown eval_metric {m!r}. Built-in XGBoost metrics: "
+                f"{sorted(_XGB_BUILTIN_METRICS)}. "
+                f"Custom metrics available: {sorted(_CUSTOM_XGB_METRICS)}."
+            )
+
+    extra_callbacks: list[Any] = []
+
+    if len(custom_names) == 0:
+        resolved = builtin
+    elif len(custom_names) == 1:
+        # Single custom metric – pass directly as callable (no callback needed).
+        fn = _CUSTOM_XGB_METRICS[custom_names[0]]
+        resolved = builtin + [fn]
+        logger.info("Resolved custom eval metric %r → callable", custom_names[0])
+    else:
+        # Multiple custom metrics – composite callable + injection callback.
+        composite, cb = _make_composite_xgb_metric(custom_names)
+        resolved = builtin + [composite]
+        extra_callbacks.append(cb)
+        logger.info(
+            "Resolved %d custom eval metrics %s → composite callable "
+            "(early-stopping on %r) + callback",
+            len(custom_names),
+            custom_names,
+            custom_names[-1],
+        )
+
+    # ── Determine early-stopping metric and direction ───────────────────
+    # By default XGBoost monitors the *last* eval_metric.  When the user
+    # specifies ``early_stopping_metric`` we inject an explicit
+    # ``EarlyStopping`` callback with ``metric_name`` so the stopping
+    # criterion is decoupled from the eval_metric order.
+    # We also need an explicit callback whenever the monitored metric
+    # must be maximised (custom metrics default to minimize).
+    es_rounds_out: int | None = early_stopping_rounds
+
+    # Which metric drives early stopping?
+    es_metric: str = early_stopping_metric or eval_metric[-1]
+
+    if early_stopping_rounds is not None:
+        # Decide direction (maximize vs minimize)
+        needs_maximize = (
+            es_metric in _CUSTOM_METRICS_MAXIMIZE
+            or es_metric in _BUILTIN_METRICS_MAXIMIZE
+        )
+
+        # We need an explicit callback when:
+        #  1. The user specified early_stopping_metric (need metric_name), OR
+        #  2. The metric needs maximize (XGBoost default is minimize for custom)
+        need_explicit_cb = (
+            early_stopping_metric is not None
+            or es_metric in _CUSTOM_METRICS_MAXIMIZE
+            or es_metric in (_CUSTOM_XGB_METRICS.keys() - _CUSTOM_METRICS_MAXIMIZE)
+        )
+
+        if need_explicit_cb:
+            from xgboost.callback import EarlyStopping as _EarlyStopping
+
+            # For custom metrics, XGBoost logs them under the callable's
+            # __name__; for built-in metrics use the string name directly.
+            es_cb = _EarlyStopping(
+                rounds=early_stopping_rounds,
+                metric_name=es_metric,
+                maximize=needs_maximize,
+                save_best=True,
+            )
+            extra_callbacks.append(es_cb)
+            es_rounds_out = None  # caller must NOT set early_stopping_rounds
+            logger.info(
+                "Early stopping: explicit EarlyStopping(rounds=%d, "
+                "metric_name=%r, maximize=%s)",
+                early_stopping_rounds,
+                es_metric,
+                needs_maximize,
+            )
+        else:
+            logger.info(
+                "Early stopping: using default direction for metric %r",
+                es_metric,
+            )
+
+    return resolved, extra_callbacks, es_rounds_out
+
+
 # ──────────────────────────────────────────────
 # Preprocessing helpers
 # ──────────────────────────────────────────────
