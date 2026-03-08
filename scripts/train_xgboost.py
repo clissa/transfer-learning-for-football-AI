@@ -1,45 +1,85 @@
+"""Train an XGBoost classifier on merged SPADL features (source/calib/target split).
+
+All core logic lives in ``football_ai.training``.  This script is a thin
+CLI wrapper that reads config from module-level constants (or a YAML file)
+and calls into the library.
+
+Data split strategy:
+- Source: Training data (split into train 80% / validation 20% by matches, stratified by league)
+- Calib: Calibration data (reserved for future use)
+- Target: Test data (0-shot evaluation)
+
+Usage examples
+--------------
+# Using YAML config
+python -m scripts.train_xgboost --config configs/train_xgboost.yaml
+
+# Override target column from CLI
+python -m scripts.train_xgboost --config configs/train_xgboost.yaml --target-col concedes
+
+# Legacy: runs with hardcoded module-level defaults (no --config needed)
+python -m scripts.train_xgboost
+"""
 from __future__ import annotations
 
+import argparse
+import logging
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
-from matplotlib import pyplot as plt
-from sklearn.metrics import (
-    average_precision_score,
-    brier_score_loss,
-    f1_score,
-    precision_score,
-    recall_score,
-    roc_auc_score,
-    confusion_matrix,
-    ConfusionMatrixDisplay
-)
+from sklearn.metrics import confusion_matrix
 from xgboost import XGBClassifier
 
+from football_ai.config import load_config, resolve_random_state, setup_logging
+from football_ai.evaluation import (
+    evaluate_binary_with_baselines,
+    get_positive_class_scores,
+    plot_confusion_matrix,
+    print_metrics,
+    sweep_thresholds_for_f1,
+)
+from football_ai.training import (
+    build_xgb_eval_set,
+    drop_none_params,
+    load_xy_source_calib_target_split,
+    resolve_xgb_eval_metrics,
+    save_model,
+)
+
+logger = logging.getLogger(__name__)
 
 # =========================
 # Global config
 # =========================
-DATA_FILE = Path("data/spadl_data_rich/major_leagues.h5")
-RICH_ACTIONS_KEYS = ["rich_action", "rich_actions"]
+DATA_FILE = Path("data/vaep_data/major_leagues_vaep.h5")
+DATA_KEY = "vaep_data"
 TARGET_COL = "scores"  # or "concedes"
 
-RESULTS_PATH = Path("results/debug_train_xgboost_rich")
-RESULTS_PATH.mkdir(parents=True, exist_ok=True)
+RESULTS_PATH = Path("results/train_xgboost_vaep")
+MODELS_PATH = Path("models")
 
-VALIDATION_COMPETITIONS = [
+# Source: Data used for training (split into train/val by matches)
+SOURCE_COMPETITIONS = [
+    "Premier League",
+    "La Liga",
+]
+# Calib: Reserved for calibration (not used in current training)
+CALIB_COMPETITIONS = [
     "Serie A",
     "Ligue 1",
 ]
-TEST_COMPETITIONS = [
+# Target: 0-shot evaluation competitions
+TARGET_COMPETITIONS = [
     "Champions League",
     "UEFA Europa League",
 ]
-# Keep None to automatically use all remaining competitions as train.
-TRAIN_COMPETITIONS: list[str] | None = None
-RANDOM_STATE = 20260305
+
+# Fraction of source matches to use for validation (stratified by league)
+VALIDATION_FRAC = 0.2
+RANDOM_STATE: int | None = None
 
 # XGBoost objective/loss examples:
 # - "binary:logistic" (binary probabilities)
@@ -76,21 +116,21 @@ XGB_MODEL_CONFIG: dict[str, Any] = {
     "objective": OBJECTIVE,
     "booster": "gbtree",  # gbtree, gblinear, dart
     "tree_method": "hist",  # auto, exact, approx, hist
-    "device": "cuda",  # cpu, cuda
-    "n_estimators": 2000,
-    "learning_rate": 0.05,
+    "device": "cpu",  # cpu, cuda
+    "n_estimators": 4000,
+    "learning_rate": 0.03,
     "verbosity": 1,
     "n_jobs": -1,
     "random_state": RANDOM_STATE,
 
     # Tree complexity / regularization
     "max_depth": 6,
-    "max_leaves": 0,
+    # "max_leaves": 0,
     "max_bin": 256,
-    "grow_policy": "lossguide",  # depthwise, lossguide
+    "grow_policy": "depthwise",  # depthwise, lossguide
     "gamma": 0.0,
     "min_child_weight": 1.0,
-    "max_delta_step": 0.0,
+    "max_delta_step": 1.0,
 
     # Subsampling
     "subsample": 0.8,
@@ -103,7 +143,7 @@ XGB_MODEL_CONFIG: dict[str, Any] = {
     "reg_alpha": 0.0,
     "reg_lambda": 1.0,
     # "scale_pos_weight": None,
-    "scale_pos_weight": 90,
+    "scale_pos_weight": 80,
 
     # Base / missing
     "base_score": None,
@@ -149,365 +189,290 @@ XGB_FIT_CONFIG: dict[str, Any] = {
 # =========================
 
 
-def _drop_none(d: dict[str, Any]) -> dict[str, Any]:
-    return {k: v for k, v in d.items() if v is not None}
-
-
-def _read_rich_actions(data_file: Path, key_candidates: list[str]) -> pd.DataFrame:
-    if not data_file.exists():
-        raise FileNotFoundError(f"Missing H5 dataset file: {data_file}")
-
-    with pd.HDFStore(str(data_file), mode="r") as store:
-        available_keys = set(store.keys())
-        selected_key = None
-        for key in key_candidates:
-            key_with_slash = f"/{key}"
-            if key_with_slash in available_keys:
-                selected_key = key
-                break
-        if selected_key is None:
-            raise KeyError(
-                f"None of keys {key_candidates} found in {data_file}. "
-                f"Available keys: {sorted(available_keys)}"
-            )
-        print(f"Using H5 key '{selected_key}' from {data_file}")
-        return store.get(f"/{selected_key}")
-
-
-def load_xy_from_rich_actions(
-    target_col: str,
-    data_file: Path,
-    key_candidates: list[str],
-    validation_competitions: list[str],
-    test_competitions: list[str],
-    train_competitions: list[str] | None = None,
-) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.Series, pd.DataFrame, pd.Series, list[str], list[str], list[str]]:
-    if target_col not in {"scores", "concedes"}:
-        raise ValueError("target_col must be 'scores' or 'concedes'")
-
-    df = _read_rich_actions(data_file=data_file, key_candidates=key_candidates).copy()
-    if "competition_name" not in df.columns:
-        raise KeyError("Expected 'competition_name' column in rich actions dataset")
-
-    df["competition_name"] = df["competition_name"].astype(str)
-    all_competitions = sorted(df["competition_name"].dropna().unique().tolist())
-
-    val_set = set(validation_competitions)
-    test_set = set(test_competitions)
-    if train_competitions is None:
-        train_set = set(all_competitions) - val_set - test_set
-    else:
-        train_set = set(train_competitions)
-
-    overlap = (train_set & val_set) | (train_set & test_set) | (val_set & test_set)
-    if overlap:
-        raise ValueError(f"Train/val/test competition sets overlap: {sorted(overlap)}")
-
-    df_train = df[df["competition_name"].isin(train_set)].copy()
-    df_val = df[df["competition_name"].isin(val_set)].copy()
-    df_test = df[df["competition_name"].isin(test_set)].copy()
-
-    if df_train.empty:
-        raise ValueError("Train split is empty after applying competition filters")
-    if df_val.empty:
-        raise ValueError("Validation split is empty after applying competition filters")
-    if df_test.empty:
-        raise ValueError("Test split is empty after applying competition filters")
-
-    excluded_cols = {"game_id", "action_id", "scores", "concedes", "competition_name"}
-    feature_cols = [
-        col
-        for col in df.select_dtypes(include=[np.number, bool]).columns
-        if col not in excluded_cols
-    ]
-    if not feature_cols:
-        raise ValueError("No numeric feature columns available in rich actions dataset")
-
-    X_train = df_train[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0)
-    y_train = df_train[target_col].astype(int)
-
-    X_val = df_val[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0)
-    y_val = df_val[target_col].astype(int)
-
-    X_test = df_test[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0)
-    y_test = df_test[target_col].astype(int)
-
-    return (
-        X_train,
-        y_train,
-        X_val,
-        y_val,
-        X_test,
-        y_test,
-        sorted(train_set),
-        sorted(val_set),
-        sorted(test_set),
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Train an XGBoost classifier on merged SPADL features.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-
-
-def build_eval_set(
-    mode: str,
-    X_train: pd.DataFrame,
-    y_train: pd.Series,
-    X_val: pd.DataFrame,
-    y_val: pd.Series,
-    train_feature_cols: list[str],
-) -> tuple[list[tuple[pd.DataFrame, pd.Series]] | None, str]:
-    if mode == "none":
-        return None, "none"
-
-    if mode == "train_val_split":
-        eval_set: list[tuple[pd.DataFrame, pd.Series]] = []
-        if INCLUDE_TRAIN_IN_EVAL_SET:
-            eval_set.append((X_train, y_train))
-        eval_set.append((X_val.reindex(columns=train_feature_cols, fill_value=0), y_val))
-        return eval_set, "train_val_split"
-
-    raise ValueError(
-        "VALIDATION_SET_MODE must be one of: 'train_val_split', 'none'"
+    parser.add_argument(
+        "--config", type=str, default=None,
+        help="Path to a YAML config file (e.g. configs/train_xgboost.yaml)",
     )
+    parser.add_argument("--target-col", type=str, default=None, help="Target column: scores or concedes")
+    parser.add_argument("--data-file", type=str, default=None, help="Path to HDF5 data file")
+    parser.add_argument("--output-dir", type=str, default=None, help="Directory for result CSVs")
+    parser.add_argument("--seed", type=int, default=None, help="Random state")
+    parser.add_argument("--device", type=str, default=None, help="XGBoost device: cpu or cuda")
+    return parser.parse_args()
 
-
-def evaluate_binary(
-    y_proba: np.ndarray,
-    y: pd.Series,
-    threshold: float = 0.5,
-) -> dict[str, float]:
-    y_pred = (y_proba >= threshold).astype(int)
-    
-    # Naive classifier: always predict majority class
-    # y_pred_naive = np.full_like(y, y.mode()[0], dtype=int)
-    y_pred_allpositives = np.ones_like(y, dtype=int)
-    rng = np.random.default_rng()
-    y_pred_smart_naive = rng.choice(
-        [0, 1],
-        size=len(y),
-        p=[1 - y.mean(), y.mean()]
-    )
-    return {
-        "rows": float(len(y)),
-        "positive_rate": float(y.mean()),
-        "precision": float(precision_score(y, y_pred, zero_division=0)),
-        "recall": float(recall_score(y, y_pred, zero_division=0)),
-        "f1": float(f1_score(y, y_pred, zero_division=0)),
-        "roc_auc": float(roc_auc_score(y, y_proba)) if y.nunique() > 1 else float("nan"),
-        "pr_auc": float(average_precision_score(y, y_proba)),
-        "brier": float(brier_score_loss(y, y_proba)),
-        "smart_naive_precision": float(precision_score(y, y_pred_smart_naive, zero_division=0)),
-        "smart_naive_recall": float(recall_score(y, y_pred_smart_naive, zero_division=0)),
-        "smart_naive_f1": float(f1_score(y, y_pred_smart_naive, zero_division=0)),
-        "positives_precision": float(precision_score(y, y_pred_allpositives, zero_division=0)),
-        "positives_recall": float(recall_score(y, y_pred_allpositives, zero_division=0)),
-        "positives_f1": float(f1_score(y, y_pred_allpositives, zero_division=0)),
-    
-    }
-
-
-def get_positive_class_scores(model: Any, X: pd.DataFrame) -> np.ndarray:
-    """Return positive-class scores for thresholding."""
-    if not hasattr(model, "predict_proba"):
-        raise AttributeError(
-            "Model has no predict_proba; threshold sweep requires probabilistic scores."
-        )
-    scores = model.predict_proba(X)
-    if scores.ndim != 2 or scores.shape[1] < 2:
-        raise ValueError(
-            "predict_proba did not return 2-class probabilities. "
-            "Use an objective that supports probabilities (e.g. 'binary:logistic')."
-        )
-    return scores[:, 1]
-
-
-def sweep_thresholds_for_f1(
-    y_true: pd.Series,
-    y_score: np.ndarray,
-    threshold_min: float,
-    threshold_max: float,
-    threshold_steps: int,
-) -> tuple[pd.DataFrame, float]:
-    thresholds = np.linspace(threshold_min, threshold_max, threshold_steps)
-    rows: list[dict[str, float]] = []
-
-    for t in thresholds:
-        y_pred = (y_score >= t).astype(int)
-        rows.append(
-            {
-                "threshold": float(t),
-                "precision": float(precision_score(y_true, y_pred, zero_division=0)),
-                "recall": float(recall_score(y_true, y_pred, zero_division=0)),
-                "f1": float(f1_score(y_true, y_pred, zero_division=0)),
-                "pred_positive_rate": float(y_pred.mean()),
-            }
-        )
-
-    sweep_df = pd.DataFrame(rows).sort_values("threshold").reset_index(drop=True)
-    best_idx = (
-        sweep_df.sort_values(["f1", "precision", "recall"], ascending=[False, False, False])
-        .index[0]
-    )
-    best_threshold = float(sweep_df.loc[best_idx, "threshold"])
-    return sweep_df, best_threshold
-
-
-def _print_metrics(title: str, metrics: dict[str, float]) -> None:
-    print(f"\n=== {title} ===")
-    for k, v in metrics.items():
-        print(f"{k:>14}: {v:.6f}")
-
-
-def plot_confusion_matrix(cm, split_name):
-    
-    fig, ax = plt.subplots(figsize=(8, 6))
-    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=["Negative", "Positive"])
-    disp.plot(ax=ax, cmap="Blues", values_format="d")
-    ax.set_title(f"Confusion Matrix - {split_name.upper()}")
-    plt.tight_layout()
-    plt.savefig(RESULTS_PATH / f"confusion_matrix_{split_name}_{TARGET_COL}.png", dpi=300)
-    plt.close()
-    
-    tn, fp, fn, tp = cm.ravel()
-    print(f"\n=== {split_name.upper()} ===")    
-    print(f"TP: {tp}, TN: {tn}, FP: {fp}, FN: {fn}")
 
 def main() -> int:
+    args = parse_args()
+    setup_logging("train_xgboost")
+
+    # Build effective config: module defaults -> YAML -> CLI overrides
+    # We only override the few keys that make sense from CLI; the full model
+    # config is best changed via YAML.
+    cfg: dict[str, Any] = {}
+    if args.config is not None:
+        cfg = load_config(args.config)
+
+    # --- Resolve data settings ---
+    data_file = Path(
+        args.data_file
+        or cfg.get("data", {}).get("file")
+        or str(DATA_FILE)
+    )
+    key_candidates: list[str] = cfg.get("data", {}).get("key_candidates", DATA_KEY)
+    target_col: str = args.target_col or cfg.get("data", {}).get("target_col", TARGET_COL)
+
+    # --- Resolve split settings ---
+    split_cfg = cfg.get("split", {})
+    source_competitions: list[str] = split_cfg.get("source_competitions", SOURCE_COMPETITIONS)
+    calib_competitions: list[str] = split_cfg.get("calib_competitions", CALIB_COMPETITIONS)
+    target_competitions: list[str] = split_cfg.get("target_competitions", TARGET_COMPETITIONS)
+    validation_frac: float = float(split_cfg.get("validation_frac", VALIDATION_FRAC))
+
+    # --- Resolve model config ---
+    model_cfg_from_yaml = cfg.get("model", {})
+    random_state: int = resolve_random_state(
+        args.seed, model_cfg_from_yaml.get("random_state"), RANDOM_STATE,
+    )
+
+    # Start from module-level defaults, overlay YAML model section, then CLI overrides
+    # Keys that are ours (not XGBoost constructor params) must be excluded.
+    _NON_XGB_KEYS = {"early_stopping_metric"}
+    effective_model_config = dict(XGB_MODEL_CONFIG)
+    for k, v in model_cfg_from_yaml.items():
+        if k in _NON_XGB_KEYS:
+            continue
+        if k == "eval_metric" and isinstance(v, str):
+            effective_model_config[k] = v
+        elif v is not None:
+            effective_model_config[k] = v
+    effective_model_config["random_state"] = random_state
+    if args.device is not None:
+        effective_model_config["device"] = args.device
+
+    # --- Resolve fit config ---
+    fit_cfg_from_yaml = cfg.get("fit", {})
+    effective_fit_config = dict(XGB_FIT_CONFIG)
+    effective_fit_config.update({k: v for k, v in fit_cfg_from_yaml.items() if v is not None})
+
+    # --- Resolve validation settings ---
+    val_cfg = cfg.get("validation", {})
+    validation_set_mode: str = val_cfg.get("mode", VALIDATION_SET_MODE)
+    include_train_in_eval_set: bool = val_cfg.get("include_train_in_eval_set", INCLUDE_TRAIN_IN_EVAL_SET)
+
+    # --- Resolve threshold settings ---
+    thr_cfg = cfg.get("threshold", {})
+    pred_threshold: float = float(thr_cfg.get("pred_threshold", PRED_THRESHOLD))
+    enable_threshold_sweep: bool = bool(thr_cfg.get("enabled", ENABLE_THRESHOLD_SWEEP))
+    threshold_min: float = float(thr_cfg.get("min", THRESHOLD_MIN))
+    threshold_max: float = float(thr_cfg.get("max", THRESHOLD_MAX))
+    threshold_steps: int = int(thr_cfg.get("steps", THRESHOLD_STEPS))
+
+    # --- Resolve output ---
+    results_path = Path(
+        args.output_dir
+        or cfg.get("output", {}).get("dir")
+        or str(RESULTS_PATH)
+    )
+    results_path.mkdir(parents=True, exist_ok=True)
+
+    models_path = Path(cfg.get("output", {}).get("models_dir", str(MODELS_PATH)))
+    models_path.mkdir(parents=True, exist_ok=True)
+
+    # Unique run identifier (timestamp) to avoid overwriting previous artifacts
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # ---- Run ----
     (
         X_train,
         y_train,
         X_val,
         y_val,
-        X_test,
-        y_test,
-        train_competitions_used,
-        val_competitions_used,
-        test_competitions_used,
-    ) = load_xy_from_rich_actions(
-        target_col=TARGET_COL,
-        data_file=DATA_FILE,
-        key_candidates=RICH_ACTIONS_KEYS,
-        validation_competitions=VALIDATION_COMPETITIONS,
-        test_competitions=TEST_COMPETITIONS,
-        train_competitions=TRAIN_COMPETITIONS,
+        X_calib,
+        y_calib,
+        X_target,
+        y_target,
+        source_competitions_used,
+        calib_competitions_used,
+        target_competitions_used,
+    ) = load_xy_source_calib_target_split(
+        target_col=target_col,
+        data_file=data_file,
+        key_candidates=key_candidates,
+        source_competitions=source_competitions,
+        calib_competitions=calib_competitions,
+        target_competitions=target_competitions,
+        validation_frac=validation_frac,
+        random_state=random_state,
     )
 
     X_train = X_train.astype(np.float32)
     X_val = X_val.astype(np.float32)
-    X_test = X_test.astype(np.float32)
+    X_calib = X_calib.astype(np.float32)
+    X_target = X_target.astype(np.float32)
     y_train = y_train.astype(np.uint8)
     y_val = y_val.astype(np.uint8)
-    y_test = y_test.astype(np.uint8)
+    y_calib = y_calib.astype(np.uint8)
+    y_target = y_target.astype(np.uint8)
 
     train_feature_cols = list(X_train.columns)
 
-    eval_set, eval_set_name = build_eval_set(
-        mode=VALIDATION_SET_MODE,
+    eval_set, eval_set_name = build_xgb_eval_set(
+        mode=validation_set_mode,
         X_train=X_train,
         y_train=y_train,
         X_val=X_val,
         y_val=y_val,
         train_feature_cols=train_feature_cols,
+        include_train=include_train_in_eval_set,
     )
 
-    model = XGBClassifier(**_drop_none(XGB_MODEL_CONFIG))
+    # Resolve custom eval metrics (e.g. "recall", "precision", "f1") to callables.
+    # XGBoost only allows one custom callable; when multiple are requested the
+    # resolver returns a composite callable + a companion callback.
+    # It also handles early-stopping direction and metric selection: if the
+    # user specified early_stopping_metric, that metric is monitored regardless
+    # of eval_metric order.
+    early_stopping_metric: str | None = model_cfg_from_yaml.get("early_stopping_metric")
+    resolved_metrics, extra_callbacks, es_rounds = resolve_xgb_eval_metrics(
+        effective_model_config.get("eval_metric"),
+        early_stopping_rounds=effective_model_config.get("early_stopping_rounds"),
+        early_stopping_metric=early_stopping_metric,
+    )
+    effective_model_config["eval_metric"] = resolved_metrics
+    effective_model_config["early_stopping_rounds"] = es_rounds  # None if handled by callback
+    if extra_callbacks:
+        existing_cbs = effective_model_config.get("callbacks") or []
+        effective_model_config["callbacks"] = extra_callbacks + list(existing_cbs)
 
-    fit_kwargs = _drop_none(XGB_FIT_CONFIG)
+    model = XGBClassifier(**drop_none_params(effective_model_config))
+
+    fit_kwargs = drop_none_params(effective_fit_config)
     if eval_set is not None:
         fit_kwargs["eval_set"] = eval_set
 
-    print("Model:", "xgboost")
-    print("Target:", TARGET_COL)
-    print("Objective:", XGB_MODEL_CONFIG.get("objective"))
-    print("Eval metric:", XGB_MODEL_CONFIG.get("eval_metric"))
-    print("Train competitions:", len(train_competitions_used), train_competitions_used)
-    print("Validation competitions:", len(val_competitions_used), val_competitions_used)
-    print("Test competitions:", len(test_competitions_used), test_competitions_used)
-    print("Validation mode:", eval_set_name)
+    logger.info("Model: xgboost")
+    logger.info("Target: %s", target_col)
+    logger.info("Objective: %s", effective_model_config.get("objective"))
+    logger.info("Eval metric: %s", effective_model_config.get("eval_metric"))
+    logger.info("Source competitions (train+val): %d %s", len(source_competitions_used), source_competitions_used)
+    logger.info("Calib competitions (reserved): %d %s", len(calib_competitions_used), calib_competitions_used)
+    logger.info("Target competitions (0-shot): %d %s", len(target_competitions_used), target_competitions_used)
+    logger.info("Validation fraction: %s", validation_frac)
+    logger.info("Validation mode: %s", eval_set_name)
+    logger.info("Train samples: %d | Validation samples: %d", len(X_train), len(X_val))
+    logger.info("Calib samples: %d | Target samples: %d", len(X_calib), len(X_target))
 
     model.fit(X_train, y_train, **fit_kwargs)
-    X_test = X_test.reindex(columns=train_feature_cols, fill_value=0)
+    
+    # Save trained model — include early-stopping metric value in the filename
+    # so each checkpoint is self-documenting.
+    es_metric_name = early_stopping_metric or "best"
+    es_metric_value = getattr(model, "best_score", None)
+    if es_metric_value is not None:
+        metric_tag = f"_{es_metric_name}={es_metric_value:.4f}"
+    else:
+        metric_tag = ""
+    model_filename = (
+        f"xgboost_{target_col}_{run_id}_seed{random_state}{metric_tag}.pkl"
+    )
+    model_path = models_path / model_filename
+    save_model(model, model_path)
+    logger.info("Model saved to: %s", model_path)
+    
+    X_target = X_target.reindex(columns=train_feature_cols, fill_value=0)
 
     X_val_eval = X_val.reindex(columns=train_feature_cols, fill_value=0)
 
     y_proba_train = get_positive_class_scores(model, X_train)
     y_proba_val = get_positive_class_scores(model, X_val_eval)
-    y_proba_test = get_positive_class_scores(model, X_test)
+    y_proba_target = get_positive_class_scores(model, X_target)
 
-    selected_threshold = float(PRED_THRESHOLD)
+    selected_threshold = pred_threshold
     threshold_sweep_df: pd.DataFrame | None = None
-    if ENABLE_THRESHOLD_SWEEP:
+    if enable_threshold_sweep:
         threshold_sweep_df, selected_threshold = sweep_thresholds_for_f1(
             y_true=y_val,
             y_score=y_proba_val,
-            threshold_min=THRESHOLD_MIN,
-            threshold_max=THRESHOLD_MAX,
-            threshold_steps=THRESHOLD_STEPS,
+            threshold_min=threshold_min,
+            threshold_max=threshold_max,
+            threshold_steps=threshold_steps,
         )
         threshold_sweep_df.to_csv(
-            RESULTS_PATH / f"threshold_sweep_xgboost_{TARGET_COL}.csv",
+            results_path / f"threshold_sweep_xgboost_{target_col}_{run_id}.csv",
             index=False,
         )
-        print(f"\nSelected threshold from validation F1 sweep: {selected_threshold:.4f}")
+        logger.info("Selected threshold from validation F1 sweep: %.4f", selected_threshold)
 
-    train_metrics = evaluate_binary(y_proba_train, y_train, threshold=selected_threshold)
-    val_metrics = evaluate_binary(y_proba_val, y_val, threshold=selected_threshold)
-    test_metrics = evaluate_binary(y_proba_test, y_test, threshold=selected_threshold)
+    train_metrics = evaluate_binary_with_baselines(y_proba_train, y_train, threshold=selected_threshold)
+    val_metrics = evaluate_binary_with_baselines(y_proba_val, y_val, threshold=selected_threshold)
+    target_metrics = evaluate_binary_with_baselines(y_proba_target, y_target, threshold=selected_threshold)
 
-    _print_metrics("TRAIN", train_metrics)
-    _print_metrics("VALIDATION", val_metrics)
-    _print_metrics("TEST", test_metrics)
+    print_metrics("TRAIN (in-sample)", train_metrics)
+    print_metrics("VALIDATION (in-sample)", val_metrics)
+    print_metrics("TARGET (0-shot)", target_metrics)
 
     results_df = pd.DataFrame(
         {
-            "split": ["train", "validation", "test"],
+            "split": ["train", "validation", "target"],
+            "description": ["in-sample", "in-sample", "0-shot"],
             "league_season": [
-                "major_leagues_group",
-                "major_leagues_group",
-                "european_competitions_group",
+                "source_group",
+                "source_group",
+                "target_group",
             ],
-            **{k: [train_metrics[k], val_metrics[k], test_metrics[k]] for k in train_metrics},
+            **{k: [train_metrics[k], val_metrics[k], target_metrics[k]] for k in train_metrics},
         }
     )
-    results_df.to_csv(RESULTS_PATH / f"metrics_xgboost_positive-focus_{TARGET_COL}.csv", index=False)
+    results_df.to_csv(results_path / f"metrics_xgboost_positive-focus_{target_col}_{run_id}.csv", index=False)
 
     # Compute confusion matrices
     train_cm = confusion_matrix(y_train, (y_proba_train >= selected_threshold).astype(int))
     val_cm = confusion_matrix(y_val, (y_proba_val >= selected_threshold).astype(int))
-    test_cm = confusion_matrix(y_test, (y_proba_test >= selected_threshold).astype(int))
+    target_cm = confusion_matrix(y_target, (y_proba_target >= selected_threshold).astype(int))
 
-    plot_confusion_matrix(train_cm, "train")
-    plot_confusion_matrix(val_cm, "validation")
-    plot_confusion_matrix(test_cm, "test")
+    plot_confusion_matrix(train_cm, "train", results_path / f"confusion_matrix_train_{target_col}_{run_id}.png")
+    plot_confusion_matrix(val_cm, "validation", results_path / f"confusion_matrix_validation_{target_col}_{run_id}.png")
+    plot_confusion_matrix(target_cm, "target", results_path / f"confusion_matrix_target_{target_col}_{run_id}.png")
 
     config_df = pd.DataFrame(
         {
             "model": ["xgboost"],
-            "target": [TARGET_COL],
-            "objective": [XGB_MODEL_CONFIG.get("objective")],
-            "eval_metric": [str(XGB_MODEL_CONFIG.get("eval_metric"))],
-            "train_dataset_group": [str(train_competitions_used)],
-            "validation_dataset_group": [str(val_competitions_used)],
-            "test_dataset_group": [str(test_competitions_used)],
-            "data_file": [str(DATA_FILE)],
-            "h5_key_candidates": [str(RICH_ACTIONS_KEYS)],
+            "target": [target_col],
+            "objective": [effective_model_config.get("objective")],
+            "eval_metric": [str(effective_model_config.get("eval_metric"))],
+            "source_competitions": [str(source_competitions_used)],
+            "calib_competitions": [str(calib_competitions_used)],
+            "target_competitions": [str(target_competitions_used)],
+            "validation_frac": [validation_frac],
+            "data_file": [str(data_file)],
+            "h5_key_candidates": [str(key_candidates)],
             "validation_set_mode": [eval_set_name],
-            "random_state": [RANDOM_STATE],
-            "pred_threshold": [PRED_THRESHOLD],
+            "random_state": [random_state],
+            "pred_threshold": [pred_threshold],
             "selected_threshold": [selected_threshold],
-            "threshold_sweep_enabled": [ENABLE_THRESHOLD_SWEEP],
-            "threshold_grid": [f"{THRESHOLD_MIN}:{THRESHOLD_MAX}:{THRESHOLD_STEPS}"],
-            "xgb_model_config": [str(_drop_none(XGB_MODEL_CONFIG))],
-            "xgb_fit_config": [str(_drop_none(XGB_FIT_CONFIG))],
+            "threshold_sweep_enabled": [enable_threshold_sweep],
+            "threshold_grid": [f"{threshold_min}:{threshold_max}:{threshold_steps}"],
+            "model_path": [str(model_path)],
+            "xgb_model_config": [str(drop_none_params(effective_model_config))],
+            "xgb_fit_config": [str(drop_none_params(effective_fit_config))],
         }
     )
-    config_df.to_csv(RESULTS_PATH / f"config_xgboost_{TARGET_COL}.csv", index=False)
+    config_df.to_csv(results_path / f"config_xgboost_{target_col}_{run_id}.csv", index=False)
 
     # FOR INTERACTIVE DEBUGGING/RESULTS EXPLORATION
     # Filter to rows where model predicted goal (probability = 1)
-    # goals_mask = y_proba_test >= selected_threshold
-    # X_test_goals = X_test[goals_mask]
+    # goals_mask = y_proba_target >= selected_threshold
+    # X_target_goals = X_target[goals_mask]
     
     # # Keep only columns with variance (exclude constant columns)
-    # relevant_cols = [col for col in X_test_goals.columns if X_test_goals[col].nunique() > 1]
-    # X_test_goals[relevant_cols].to_csv(RESULTS_PATH / f"predicted_goals_{TARGET_COL}.csv", index=False)
+    # relevant_cols = [col for col in X_target_goals.columns if X_target_goals[col].nunique() > 1]
+    # X_target_goals[relevant_cols].to_csv(results_path / f"predicted_goals_{target_col}.csv", index=False)
 
     return 0
 

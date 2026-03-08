@@ -1,0 +1,43 @@
+# Configuration for scripts/train.py (sklearn models)
+# Usage: python -m scripts.train --config configs/train_sklearn.yaml
+
+data:
+  dir: "data/spadl_data"
+  target_col: "scores"       # or "concedes"
+
+train:
+  league: "La Liga"
+  season: "2015/2016"
+
+test:
+  league: "Champions League"
+  season: "2015/2016"
+
+model:
+  name: "rf"             # rf, logreg, mlp
+  random_state: 20260306
+  val_pct: 0.20
+  config:
+    rf:
+      n_estimators: 500
+      max_depth: null
+      min_samples_leaf: 5
+      class_weight: "balanced_subsample"
+      criterion: "gini"
+      n_jobs: -1
+    logreg:
+      C: 0.1
+      class_weight: "balanced"
+      max_iter: 5000
+    mlp:
+      hidden_layer_sizes: [256, 128, 64]
+      alpha: 0.001
+      solver: "adam"
+      early_stopping: true
+      n_iter_no_change: 10
+      tol: 0.00001
+      max_iter: 200
+      verbose: true
+
+output:
+  dir: "results/rf_women"

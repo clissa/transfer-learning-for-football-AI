@@ -1,0 +1,75 @@
+# Configuration for scripts/xgboost-few-shots.py
+# Usage: python -m scripts.xgboost-few-shots --config configs/xgboost_fewshot.yaml
+#
+# Evaluates domain adaptation at multiple target-game budgets.
+# For each budget, compares:
+#   1. target-only  (train from scratch on the few-shot subset)
+#   2. fine-tune    (warm-start from a pre-trained source model)
+# Plus a source-only zero-shot baseline (no re-training).
+
+data:
+  file: "data/vaep_data/major_leagues_vaep.h5"
+  key_candidates: ["vaep_data"]
+  target_col: "scores"        # or "concedes"
+
+split:
+  source_competitions: ["Premier League", "La Liga"]
+  target_competitions: ["Champions League", "UEFA Europa League"]
+  validation_frac: 0.2        # source train/val split fraction
+  random_state: 20260307
+
+# Few-shot experiment settings
+fewshot:
+  budgets: [0.01, 0.05, 0.20]           # fraction of target games sampled
+  seeds: [1, 2, 3, 4, 5]                # repeat each budget with different seeds
+  source_model_path: "models/xgboost_scores_20260307.pkl"
+
+# Source model config (used for target-only from-scratch training)
+model:
+  objective: "binary:logistic"
+  booster: "gbtree"
+  tree_method: "hist"
+  device: "cpu"
+  n_estimators: 2000
+  learning_rate: 0.03
+  verbosity: 1
+  n_jobs: -1
+
+  max_depth: 6
+  max_bin: 256
+  grow_policy: "depthwise"
+  gamma: 0.0
+  min_child_weight: 1.0
+  max_delta_step: 1.0
+
+  subsample: 0.8
+  sampling_method: "uniform"
+  colsample_bytree: 0.8
+  colsample_bylevel: 1.0
+  colsample_bynode: 1.0
+
+  reg_alpha: 0.0
+  reg_lambda: 1.0
+  scale_pos_weight: 80
+
+  eval_metric: ["aucpr", "auc", "logloss"]
+  early_stopping_rounds: 50
+
+  importance_type: "gain"
+  validate_parameters: true
+
+# Fine-tuning overrides (warm-start from source model)
+finetune:
+  learning_rate: 0.01          # reduced LR for gentle adaptation
+  n_estimators: 500            # fewer additional boosting rounds
+  early_stopping_rounds: 30
+
+threshold:
+  enabled: true
+  pred_threshold: 0.5
+  min: 0.05
+  max: 0.95
+  steps: 90
+
+output:
+  dir: "results/fewshot_xgboost"

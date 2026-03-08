@@ -1,19 +1,43 @@
-# supervised-learning-statsbomb
+# Transfer Learning to Overcome Domain Shift in Football Analytics and Beyond
 
-Utilities and scripts for creating SPADL/VAEP datasets from StatsBomb open data.
+Python ML research project for football action valuation (VAEP) using StatsBomb open-data.
+
+Pipeline: StatsBomb JSON → SPADL actions → VAEP features/labels → model training (sklearn / XGBoost) → evaluation.
+
+Data pipeline steps:
+1. `scripts/create_spadl_dataset.py` — StatsBomb → SPADL + labels in HDF5
+2. `scripts/create_vaep_features.py` — SPADL full_data → VAEP features in HDF5
+3. `scripts/train.py` / `scripts/train_xgboost.py` — Model training
 
 ## Project structure
 
 ```text
-.
-├── data/                          # Local output/data workspace
-├── notebooks/                     # Exploratory and pipeline notebooks
+├── configs/                       # YAML experiment configs
+│   ├── create_spadl_dataset.yaml
+│   ├── create_vaep_features.yaml
+│   ├── train_sklearn.yaml
+│   ├── train_xgboost.yaml
+│   └── tune_xgboost.yaml
+├── data/                          # Local data (gitignored) — see data/README.md
+├── logs/                          # Captured stdout/stderr logs
+├── notebooks/                     # Exploratory notebooks
 ├── scripts/
-│   └── create_datasets.py         # Main data preparation script
-├── src/
-│   └── football_ai/
-│       ├── __init__.py
-│       └── utils.py               # Dataset build/save utilities
+│   ├── create_spadl_dataset.py    # SPADL data preparation CLI
+│   ├── create_vaep_features.py    # VAEP feature extraction CLI
+│   ├── train.py                   # sklearn training CLI
+│   ├── train_xgboost.py           # XGBoost training CLI
+│   └── tune_xgboost_bayes_v2.py   # Bayesian tuning CLI (Optuna)
+├── src/football_ai/
+│   ├── __init__.py
+│   ├── config.py                  # YAML loading, CLI override merging
+│   ├── data.py                    # Data loading, SPADL/VAEP conversion, HDF5 I/O
+│   ├── features.py                # VAEP feature extraction from SPADL actions
+│   ├── training.py                # Model building, training helpers, grid search
+│   └── evaluation.py              # Metrics, threshold sweep, visualization
+├── tests/
+│   ├── test_smoke_library.py
+│   └── test_smoke_train.py
+├── archive/                       # Superseded scripts (kept for reference)
 ├── pyproject.toml
 └── requirements.txt
 ```
@@ -29,62 +53,81 @@ source ./football_ai_venv/bin/activate
 
 ### 2) Install dependencies
 
-Option A (exact pinned environment):
-
 ```bash
-# runtime dependecies
+# Runtime dependencies
 pip install -r requirements.txt
 
-# football_ai local package
+# Install the football_ai package (editable)
 pip install -e .
+
+# Optional extras (see pyproject.toml for all options)
+pip install -e ".[xgboost,tuning,viz,dev]"
 ```
 
-## Running data preparation
+## Data preparation
 
-The main entrypoint is:
+Clone the [StatsBomb open-data](https://github.com/statsbomb/open-data) repository and run:
 
 ```bash
-python scripts/create_datasets.py
+# Step 1: Create SPADL dataset
+python -m scripts.create_spadl_dataset --config configs/create_spadl_dataset.yaml
+
+# Step 2: Compute VAEP features
+python -m scripts.create_vaep_features --config configs/create_vaep_features.yaml
 ```
 
-### Prerequisite data location
+The `data_root` path in the config defaults to `../open-data/data`. Update it if your checkout is elsewhere. See [data/README.md](data/README.md) for the expected output layout and HDF5 key structure.
 
-By default, `scripts/create_datasets.py` expects StatsBomb open-data JSON files at the [StatsBomb open-data repository](https://github.com/statsbomb/open-data):
+## Training
 
-```text
-../open-data/data
+### sklearn models (Logistic Regression, Random Forest, MLP)
+
+```bash
+python -m scripts.train --config configs/train_sklearn.yaml
 ```
 
-This path is controlled by `DATA_ROOT` in [`scripts/create_datasets.py`](scripts/create_datasets.py).  
-Update it if your `open-data` checkout is elsewhere.
+Override options via CLI, e.g. `--model rf`, `--target-col concedes`.
 
-### Competition/season selection
+### XGBoost
 
-Edit these constants in `scripts/create_datasets.py`:
+```bash
+python -m scripts.train_xgboost --config configs/train_xgboost.yaml
+```
 
-- `SAVE_ALL_AVAILABLE`: `True` to process all available competitions/seasons.
-- `SELECTED_NAME_PAIRS`: list of `(competition_name, season_name)` pairs when `SAVE_ALL_AVAILABLE=False`.
-- `SELECTED_ID_PAIRS`: list of `(competition_id, season_id)` pairs (alternative to names).
-- `NUMBER_PREVIOUS_ACTIONS`: context window for VAEP feature generation.
+Override options via CLI, e.g. `--target-col concedes`.
 
-Use either `SELECTED_NAME_PAIRS` or `SELECTED_ID_PAIRS`, not both.
+### Bayesian hyperparameter tuning (Optuna + XGBoost)
 
-### Output files
+```bash
+python -m scripts.tune_xgboost_bayes_v2 --config configs/tune_xgboost.yaml
+```
 
-The script writes HDF5 feature/label files to `OUTPUT_DIR` (default: `data/spadl_data`) with names like:
+Override options via CLI, e.g. `--n-trials 50`.
 
-- `features_<competition>_<season>.h5`
-- `labels_<competition>_<season>.h5`
+### Capturing logs
 
-Each file contains one table key:
+Pipe stdout/stderr to `logs/` for reproducibility:
 
-- features file: `features`
-- labels file: `labels`
+```bash
+python -m scripts.train --config configs/train_sklearn.yaml 2>&1 | tee logs/train_sklearn.log
+```
+
+## Tests
+
+```bash
+pytest tests/ -v
+```
 
 ## Notebooks
 
-The `notebooks/` folder contains interactive Jupyter notebooks:
+The `notebooks/` folder contains exploratory Jupyter notebooks:
 
-- `create_spadl_dataset.ipynb`: Initial full data preparation and model training pipeline.
-- `socceraction_supervised_learning_simple.ipynb`: Simplified training example as a starter point for experimentation.
+- `process_statsbomb_data.ipynb` — Minimal tutorial: load one competition, convert to SPADL, generate VAEP features/labels.
+- `create_spadl_dataset.ipynb` — End-to-end pipeline covering all competitions: SPADL conversion, VAEP generation, merged dataset.
+- `create_spadl_dataset_major_leagues.ipynb` — Data pipeline + quick RF evaluation for major men's leagues.
+- `create_spadl_dataset_women_league_season.ipynb` — Same pipeline for women's leagues.
+- `socceraction_supervised_learning.ipynb` — Multi-model comparison: train on one league-season, test on all others.
+- `socceraction_supervised_learning_simple.ipynb` — Simplified version with GridSearchCV tuning.
+
+> **Note:** Notebooks are exploratory and may not reflect the latest library API. For production workflows, use the scripts above.
 

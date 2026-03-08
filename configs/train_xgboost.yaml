@@ -1,0 +1,85 @@
+# Configuration for scripts/train_xgboost.py
+# Usage: python -m scripts.train_xgboost --config configs/train_xgboost.yaml
+#
+# Data split strategy:
+# - Source: training competitions (split into train 80% / validation 20% by matches, stratified by league)
+# - Calib: calibration competitions (reserved for future use)
+# - Target: test competitions (0-shot evaluation)
+
+data:
+  file: "data/vaep_data/major_leagues_vaep.h5"
+  key_candidates: ["vaep_data"]
+  target_col: "scores"        # or "concedes"
+
+split:
+  # Source: competitions used for training (split into train 80% / validation 20% by matches, stratified by league)
+  source_competitions: ["Premier League", "La Liga"]
+  # Calib: reserved for calibration (not used in current training)
+  calib_competitions: ["Serie A", "Ligue 1"]
+  # Target: 0-shot evaluation competitions
+  target_competitions: ["Champions League", "UEFA Europa League"]
+  # Fraction of source matches to use for validation (stratified by league)
+  validation_frac: 0.2
+
+model:
+  objective: "binary:logistic"
+  booster: "gbtree"
+  tree_method: "hist"
+  device: "cpu"
+  n_estimators: 4000
+  learning_rate: 0.03
+  verbosity: 1
+  n_jobs: -1
+  random_state: None
+
+  # Tree complexity / regularization
+  max_depth: 5
+  # max_leaves: 0
+  max_bin: 256
+  grow_policy: "depthwise"
+  gamma: 1.0
+  min_child_weight: 5.0
+  max_delta_step: 1.0
+
+  # Subsampling
+  subsample: 0.8
+  sampling_method: "uniform"
+  colsample_bytree: 0.8
+  colsample_bylevel: 1.0
+  colsample_bynode: 1.0
+
+  # L1/L2 and imbalance
+  reg_alpha: 0.0
+  reg_lambda: 1.0
+  scale_pos_weight: 80
+
+  # Eval and early stopping
+  # eval_metric: ["aucpr", "logloss", "auc"]
+  # eval_metric: ["logloss", "auc", "aucpr"]
+  eval_metric: ['aucpr', 'auc', 'logloss', 'f1', 'precision', 'recall']
+  early_stopping_rounds: 10
+  # Which metric to monitor for early stopping (default: last in eval_metric).
+  # Decouples stopping criterion from eval_metric order.
+  early_stopping_metric: "recall"
+
+  # sklearn wrapper controls
+  importance_type: "gain"
+  validate_parameters: true
+
+fit:
+  verbose: true
+
+validation:
+  mode: "train_val_split"       # or "none"
+  include_train_in_eval_set: false
+
+threshold:
+  enabled: true
+  pred_threshold: 0.5
+  min: 0.05
+  max: 0.95
+  steps: 90
+
+output:
+  dir: "results/train_xgboost_vaep"
+  models_dir: "models"

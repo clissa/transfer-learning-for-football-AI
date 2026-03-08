@@ -1,0 +1,19 @@
+# Configuration for scripts/create_spadl_dataset.py
+# Usage: python -m scripts.create_spadl_dataset --config configs/create_spadl_dataset.yaml
+
+data_root: "../open-data/data"
+output_dir: "data/spadl_data"
+outname: "major_leagues.h5"
+nb_prev_actions: 3
+
+leagues:
+  - "La Liga"
+  - "Serie A"
+  - "Premier League"
+  - "1. Bundesliga"
+  - "Ligue 1"
+  - "Champions League"
+  - "UEFA Europa League"
+
+# Set to true to include ALL available competitions (overrides leagues list)
+# all_leagues: false

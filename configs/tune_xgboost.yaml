@@ -1,0 +1,63 @@
+# Configuration for scripts/tune_xgboost_bayes_v2.py
+# Usage: python -m scripts.tune_xgboost_bayes_v2 --config configs/tune_xgboost.yaml
+
+data:
+  file: "data/spadl_data_rich/major_leagues.h5"
+  key_candidates: ["rich_action", "rich_actions"]
+  target_col: "scores"        # or "concedes"
+
+split:
+  validation_competitions: ["Serie A", "Ligue 1"]
+  test_competitions: ["Champions League", "UEFA Europa League"]
+
+optuna:
+  n_trials: 300
+  timeout_seconds: null
+  random_state: 20260305
+
+training:
+  n_estimators: 20000
+  early_stopping_rounds: 200
+  base_params:
+    booster: "gbtree"
+    tree_method: "hist"
+    device: "cuda"
+    n_jobs: -1
+    verbosity: 0
+    validate_parameters: true
+    importance_type: "gain"
+    objective: "binary:logistic"
+    eval_metric: "aucpr"
+
+  scale_pos_weight_choices: [null, 10, 50, 75, 100, 200]
+
+threshold:
+  fixed: 0.9026              # comparison only; operating threshold chosen on val
+
+features:
+  numeric:
+    - "time_seconds"
+    - "start_x"
+    - "start_y"
+    - "end_x"
+    - "end_y"
+    - "home_score"
+    - "away_score"
+    - "minutes_played"
+  boolean:
+    - "is_starter"
+  categorical:
+    - "player_id"
+    - "type_id"
+    - "result_id"
+    - "bodypart_id"
+    - "competition_stage"
+    - "game_day"
+    - "venue"
+    - "referee"
+    - "starting_position_id"
+  derived_boolean:
+    - "is_home_team"
+
+output:
+  dir: "results/xgboost_bayes_tuning"

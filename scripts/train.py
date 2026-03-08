@@ -1,54 +1,64 @@
+"""Train a single sklearn model (rf / logreg / mlp) on merged SPADL features.
+
+Uses ``load_xy_competition_split`` to split train/val/test by competition
+name (all seasons for each specified league).  Reads a single HDF5 file
+containing a ``full_data`` key.
+
+Usage examples
+--------------
+# Using YAML config
+python -m scripts.train --config configs/train_sklearn.yaml
+
+# Override model from CLI
+python -m scripts.train --config configs/train_sklearn.yaml --model rf
+
+# Legacy: runs with hardcoded module-level defaults (no --config needed)
+python -m scripts.train
+"""
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import (
-    average_precision_score,
-    brier_score_loss,
-    f1_score,
-    precision_score,
-    recall_score,
-    roc_auc_score,
-)
-from sklearn.neural_network import MLPClassifier
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
 
-from football_ai.utils import make_dataset_key
+from football_ai.config import load_config, merge_cli_overrides, resolve_random_state
+from football_ai.evaluation import (
+    evaluate_binary,
+    get_positive_class_scores,
+    print_metrics,
+)
+from football_ai.training import (
+    build_sklearn_model,
+    load_xy_competition_split,
+)
 
 # =========================
 # Global config
 # =========================
-DATA_DIR = Path("data/spadl_data")
-TARGET_COL = "scores"  # or "concedes"
+DATA_FILE = Path("data/spadl_full_data")
+DATASET_NAME = "women_leagues.h5"          # configurable filename
+KEY_CANDIDATES = ["full_data"]
+TARGET_COL = "scores"                      # or "concedes"
 
-RESULTS_PATH = Path("results/debug_train")
-RESULTS_PATH.mkdir(exist_ok=True)
 
-TRAIN_LEAGUE = "La Liga"
-TRAIN_SEASON = "2015/2016"
+TRAIN_COMPETITIONS = ["FA Women's Super League"]
+VALIDATION_COMPETITIONS = ["UEFA Women's Euro"]
+TEST_COMPETITIONS = ["Women's World Cup"]
 
-TEST_LEAGUE = "Champions League"
-TEST_SEASON = "2015/2016"
+RANDOM_STATE: int | None = 20260306
 
-VAL_PCT = 0.20
-RANDOM_STATE = 20260304
-
-# Model choices: "rf", "logreg", "mlp"
-# MODEL_NAME = "rf"
-MODEL_NAME = "logreg"
-# MODEL_NAME = "mlp"
-MODEL_CONFIG: dict = {
+MODEL_NAME = "mlp"  # rf, logreg, mlp
+RESULTS_PATH = Path(f"results/{MODEL_NAME}_women")
+MODEL_CONFIG: dict[str, dict[str, Any]] = {
     "rf": {
         "n_estimators": 500,
         "max_depth": None,
         "min_samples_leaf": 5,
         "class_weight": "balanced_subsample",
-        "criterion": "log_loss",
+        "criterion": "gini",
         "n_jobs": -1,
         "random_state": RANDOM_STATE,
     },
@@ -67,201 +77,180 @@ MODEL_CONFIG: dict = {
         "tol": 1e-5,
         "max_iter": 200,
         "verbose": True,
-        # "loss": "log_loss",
         "random_state": RANDOM_STATE,
     },
 }
 # =========================
 
 
-def _read_dataset(dataset_key: str, data_dir: Path) -> pd.DataFrame:
-    features_path = data_dir / f"features_{dataset_key}.h5"
-    labels_path = data_dir / f"labels_{dataset_key}.h5"
-
-    if not features_path.exists():
-        raise FileNotFoundError(f"Missing features file: {features_path}")
-    if not labels_path.exists():
-        raise FileNotFoundError(f"Missing labels file: {labels_path}")
-
-    df_features = pd.read_hdf(features_path, key="features")
-    df_labels = pd.read_hdf(labels_path, key="labels")
-    return df_features.merge(df_labels, on=["game_id", "action_id"], how="inner")
-
-
-def load_xy(
-    dataset_key: str,
-    target_col: str,
-    data_dir: Path,
-    val_pct: float = 0.2,
-    random_state: int = 42,
-) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.Series]:
-    """
-    Load and split one league-season into train/val based on unique game_id.
-    This prevents leakage of actions from the same game across splits.
-    """
-    if target_col not in {"scores", "concedes"}:
-        raise ValueError("target_col must be 'scores' or 'concedes'")
-    if not (0 <= val_pct < 1):
-        raise ValueError("val_pct must be in [0, 1)")
-
-    df = _read_dataset(dataset_key=dataset_key, data_dir=data_dir)
-
-    feature_cols = [
-        col
-        for col in df.columns
-        if col not in {"game_id", "action_id", "scores", "concedes"}
-    ]
-
-    game_ids = np.array(sorted(df["game_id"].unique()))
-    rng = np.random.default_rng(random_state)
-    rng.shuffle(game_ids)
-
-    n_val_games = int(round(len(game_ids) * val_pct))
-    print(f"Total games: {len(game_ids)}, Validation games: {n_val_games}")
-    val_game_ids = set(game_ids[:n_val_games])
-
-    is_val = df["game_id"].isin(val_game_ids)
-    df_train = df.loc[~is_val].copy()
-    df_val = df.loc[is_val].copy()
-
-    X_train = df_train[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0)
-    y_train = df_train[target_col].astype(int)
-
-    X_val = df_val[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0)
-    y_val = df_val[target_col].astype(int)
-
-    return X_train, y_train, X_val, y_val
-
-
-def load_xy_all(
-    dataset_key: str,
-    target_col: str,
-    data_dir: Path,
-) -> tuple[pd.DataFrame, pd.Series]:
-    """Load all actions from one dataset key without train/val split."""
-    df = _read_dataset(dataset_key=dataset_key, data_dir=data_dir)
-    feature_cols = [
-        col
-        for col in df.columns
-        if col not in {"game_id", "action_id", "scores", "concedes"}
-    ]
-    X = df[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0)
-    y = df[target_col].astype(int)
-    return X, y
-
-
-def build_model(model_name: str):
-    """
-    Default is Random Forest because VAEP-style tabular features are nonlinear
-    and class imbalance is common for scoring labels.
-    """
-    if model_name == "rf":
-        return RandomForestClassifier(**MODEL_CONFIG["rf"])
-    if model_name == "logreg":
-        return Pipeline(
-            [
-                ("scaler", StandardScaler()),
-                ("clf", LogisticRegression(**MODEL_CONFIG["logreg"])),
-            ]
-        )
-    if model_name == "mlp":
-        return Pipeline(
-            [
-                ("scaler", StandardScaler()),
-                ("clf", MLPClassifier(**MODEL_CONFIG["mlp"])),
-            ]
-        )
-    raise ValueError(f"Unknown MODEL_NAME={model_name!r}. Use one of: rf, logreg, mlp")
-
-
-def evaluate_binary(
-    model,
-    X: pd.DataFrame,
-    y: pd.Series,
-    threshold: float = 0.5,
-) -> dict[str, float]:
-    y_proba = model.predict_proba(X)[:, 1]
-    y_pred = (y_proba >= threshold).astype(int)
-    return {
-        "rows": float(len(y)),
-        "positive_rate": float(y.mean()),
-        "precision": float(precision_score(y, y_pred, zero_division=0)),
-        "recall": float(recall_score(y, y_pred, zero_division=0)),
-        "f1": float(f1_score(y, y_pred, zero_division=0)),
-        "roc_auc": float(roc_auc_score(y, y_proba)) if y.nunique() > 1 else float("nan"),
-        "pr_auc": float(average_precision_score(y, y_proba)),
-        "brier": float(brier_score_loss(y, y_proba)),
-    }
-
-
-def _print_metrics(title: str, metrics: dict[str, float]) -> None:
-    print(f"\n=== {title} ===")
-    for k, v in metrics.items():
-        print(f"{k:>14}: {v:.6f}")
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Train a single sklearn model on merged SPADL features.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--config", type=str, default=None,
+        help="Path to a YAML config file (e.g. configs/train_sklearn.yaml)",
+    )
+    parser.add_argument("--model", type=str, default=None, help="Model name: rf, logreg, mlp")
+    parser.add_argument("--target-col", type=str, default=None, help="Target column: scores or concedes")
+    parser.add_argument("--data-file", type=str, default=None, help="Path to HDF5 data file")
+    parser.add_argument("--dataset-name", type=str, default=None,
+                        help="HDF5 filename inside data dir (e.g. women_leagues.h5)")
+    parser.add_argument("--data-dir", type=str, default=None,
+                        help="Directory containing the H5 file (default: data/spadl_full_data)")
+    parser.add_argument("--output-dir", type=str, default=None, help="Directory for result CSVs")
+    parser.add_argument("--seed", type=int, default=None, help="Random state")
+    return parser.parse_args()
 
 
 def main() -> int:
-    if not DATA_DIR.exists():
-        raise FileNotFoundError(f"DATA_DIR does not exist: {DATA_DIR.resolve()}")
+    args = parse_args()
 
-    train_key = make_dataset_key(TRAIN_LEAGUE, TRAIN_SEASON)
-    test_key = make_dataset_key(TEST_LEAGUE, TEST_SEASON)
+    # Build effective config: module defaults -> YAML -> CLI overrides
+    cfg: dict[str, Any] = {
+        "data": {
+            "file": str(DATA_FILE / DATASET_NAME),
+            "dir": str(DATA_FILE),
+            "dataset_name": DATASET_NAME,
+            "key_candidates": KEY_CANDIDATES,
+            "target_col": TARGET_COL,
+        },
+        "split": {
+            "train_competitions": TRAIN_COMPETITIONS,
+            "validation_competitions": VALIDATION_COMPETITIONS,
+            "test_competitions": TEST_COMPETITIONS,
+        },
+        "model": {
+            "name": MODEL_NAME,
+            "random_state": RANDOM_STATE,
+            "config": MODEL_CONFIG,
+        },
+        "output": {"dir": str(RESULTS_PATH)},
+    }
+    if args.config is not None:
+        cfg.update(load_config(args.config))
+    cfg = merge_cli_overrides(cfg, {
+        "model.name": args.model,
+        "data.target_col": args.target_col,
+        "data.file": args.data_file,
+        "data.dataset_name": args.dataset_name,
+        "data.dir": args.data_dir,
+        "output.dir": args.output_dir,
+        "model.random_state": args.seed,
+    })
 
-    X_train, y_train, X_val, y_val = load_xy(
-        dataset_key=train_key,
-        target_col=TARGET_COL,
-        data_dir=DATA_DIR,
-        val_pct=VAL_PCT,
-        random_state=RANDOM_STATE,
+    # Unpack effective config
+    data_cfg = cfg["data"]
+    # Resolve data file: explicit --data-file wins, then YAML data.file, then dir + dataset_name
+    if args.data_file:
+        data_file = Path(args.data_file)
+    elif "file" in data_cfg and data_cfg["file"]:
+        data_file = Path(data_cfg["file"])
+    else:
+        data_file = Path(data_cfg["dir"]) / data_cfg["dataset_name"]
+
+    key_candidates: list[str] = data_cfg.get("key_candidates", KEY_CANDIDATES)
+    target_col: str = data_cfg["target_col"]
+
+    split_cfg = cfg.get("split", {})
+    train_competitions: list[str] = split_cfg.get("train_competitions", TRAIN_COMPETITIONS)
+    validation_competitions: list[str] = split_cfg.get("validation_competitions", VALIDATION_COMPETITIONS)
+    test_competitions: list[str] = split_cfg.get("test_competitions", TEST_COMPETITIONS)
+
+    model_name: str = cfg["model"]["name"]
+    random_state: int = resolve_random_state(
+        cfg["model"].get("random_state"), RANDOM_STATE,
+    )
+    model_configs: dict = cfg["model"].get("config", MODEL_CONFIG)
+    results_path = Path(cfg["output"]["dir"])
+    results_path.mkdir(parents=True, exist_ok=True)
+
+    # Inject random_state into the selected model config
+    selected_model_cfg = dict(model_configs.get(model_name, {}))
+    selected_model_cfg.setdefault("random_state", random_state)
+    if "hidden_layer_sizes" in selected_model_cfg and isinstance(
+        selected_model_cfg["hidden_layer_sizes"], list
+    ):
+        selected_model_cfg["hidden_layer_sizes"] = tuple(selected_model_cfg["hidden_layer_sizes"])
+
+    if not data_file.exists():
+        raise FileNotFoundError(f"Data file does not exist: {data_file.resolve()}")
+
+    # ---- Load data (competition split) ----
+    print(f"Loading data from {data_file} (keys: {key_candidates})")
+    print(f"  train competitions: {train_competitions}")
+    print(f"  val   competitions: {validation_competitions}")
+    print(f"  test  competitions: {test_competitions}")
+
+    (
+        X_train, y_train,
+        X_val, y_val,
+        X_test, y_test,
+        train_comps, val_comps, test_comps,
+    ) = load_xy_competition_split(
+        target_col=target_col,
+        data_file=data_file,
+        key_candidates=key_candidates,
+        train_competitions=train_competitions,
+        validation_competitions=validation_competitions,
+        test_competitions=test_competitions,
     )
 
-    X_test, y_test = load_xy_all(
-        dataset_key=test_key,
-        target_col=TARGET_COL,
-        data_dir=DATA_DIR,
-    )
+    print(f"  Train:  {len(X_train):>8,} rows  {train_comps}")
+    print(f"  Val:    {len(X_val):>8,} rows  {val_comps}")
+    print(f"  Test:   {len(X_test):>8,} rows  {test_comps}")
 
-    model = build_model(MODEL_NAME)
+    # ---- Build + train model ----
+    model = build_sklearn_model(
+        model_name=model_name,
+        model_config=selected_model_cfg,
+        random_state=random_state,
+    )
     model.fit(X_train, y_train)
 
-    feature_cols = list(X_train.columns)
-    X_val = X_val.reindex(columns=feature_cols, fill_value=0)
-    X_test = X_test.reindex(columns=feature_cols, fill_value=0)
+    # ---- Evaluate ----
+    y_proba_train = get_positive_class_scores(model, X_train)
+    y_proba_val = get_positive_class_scores(model, X_val)
+    y_proba_test = get_positive_class_scores(model, X_test)
 
-    train_metrics = evaluate_binary(model, X_train, y_train)
-    val_metrics = evaluate_binary(model, X_val, y_val)
-    test_metrics = evaluate_binary(model, X_test, y_test)
+    train_metrics = evaluate_binary(y_proba_train, y_train)
+    val_metrics = evaluate_binary(y_proba_val, y_val)
+    test_metrics = evaluate_binary(y_proba_test, y_test)
 
-    print("Model:", MODEL_NAME)
-    print("Target:", TARGET_COL)
-    print("Train dataset:", train_key)
-    print("Test dataset:", test_key)
-    print("Validation pct (game split):", VAL_PCT)
+    print(f"\nModel: {model_name}  |  Target: {target_col}")
+    print_metrics("TRAIN", train_metrics)
+    print_metrics("VALIDATION", val_metrics)
+    print_metrics("TEST", test_metrics)
 
-    _print_metrics("TRAIN", train_metrics)
-    _print_metrics("VALIDATION", val_metrics)
-    _print_metrics("TEST", test_metrics)
-
+    # ---- Save results ----
     results_df = pd.DataFrame(
         {
             "split": ["train", "validation", "test"],
-            "league_season": [f"{TRAIN_LEAGUE}_{TRAIN_SEASON}", f"{TRAIN_LEAGUE}_{TRAIN_SEASON}", f"{TEST_LEAGUE}_{TEST_SEASON}"],
+            "competitions": [
+                ", ".join(train_comps),
+                ", ".join(val_comps),
+                ", ".join(test_comps),
+            ],
             **{k: [train_metrics[k], val_metrics[k], test_metrics[k]] for k in train_metrics},
         }
     )
-    results_df.to_csv(RESULTS_PATH / f"metrics_{MODEL_NAME}_{TARGET_COL}.csv", index=False)
+    results_df.to_csv(results_path / f"metrics_{model_name}_{target_col}.csv", index=False)
+
     config_df = pd.DataFrame(
         {
-            "model": [MODEL_NAME],
-            "target": [TARGET_COL],
-            "train_league_season": [f"{TRAIN_LEAGUE}_{TRAIN_SEASON}"],
-            "test_league_season": [f"{TEST_LEAGUE}_{TEST_SEASON}"],
-            "val_pct": [VAL_PCT],
-            "random_state": [RANDOM_STATE],
-            "model_config": [str(MODEL_CONFIG[MODEL_NAME])],
+            "model": [model_name],
+            "target": [target_col],
+            "data_file": [str(data_file)],
+            "train_competitions": [str(train_competitions)],
+            "validation_competitions": [str(validation_competitions)],
+            "test_competitions": [str(test_competitions)],
+            "random_state": [random_state],
+            "model_config": [str(selected_model_cfg)],
         }
     )
-    config_df.to_csv(RESULTS_PATH / f"config_{MODEL_NAME}_{TARGET_COL}.csv", index=False)
+    config_df.to_csv(results_path / f"config_{model_name}_{target_col}.csv", index=False)
     return 0
 
 

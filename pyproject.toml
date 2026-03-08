@@ -5,8 +5,24 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "football-ai"
 version = "0.1.0"
-description = "Utilities and scripts for StatsBomb SPADL/VAEP dataset creation."
+description = "Utilities and scripts for StatsBomb SPADL/VAEP dataset creation and model training."
 requires-python = ">=3.9"
+dependencies = [
+    "scikit-learn>=1.4",
+    "pandas>=2.0",
+    "numpy>=1.24",
+    "socceraction>=1.5",
+    "tables>=3.9",
+    "tqdm",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+xgboost = ["xgboost>=2.0"]
+tuning = ["optuna>=3.0"]
+viz = ["matplotlib>=3.5"]
+dev = ["pytest>=7.0"]
+all = ["football-ai[xgboost,tuning,viz,dev]"]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
