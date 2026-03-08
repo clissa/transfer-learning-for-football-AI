@@ -69,7 +69,7 @@ def setup_logging(
 
     # File handler
     if not any(isinstance(h, logging.FileHandler) for h in root.handlers):
-        file_handler = logging.FileHandler(log_file)
+        file_handler = logging.FileHandler(str(log_file), encoding="utf-8")
         file_handler.setLevel(level)
         file_handler.setFormatter(formatter)
         root.addHandler(file_handler)
