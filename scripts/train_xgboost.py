@@ -369,18 +369,12 @@ def main() -> int:
     logger.info("Calib samples: %d | Target samples: %d", len(X_calib), len(X_target))
 
     model.fit(X_train, y_train, **fit_kwargs)
-    
-    # Save trained model — include early-stopping metric value in the filename
-    # so each checkpoint is self-documenting.
+
+    # Save trained model — filename encodes run_id, seed, and best ES metric value
     es_metric_name = early_stopping_metric or "best"
     es_metric_value = getattr(model, "best_score", None)
-    if es_metric_value is not None:
-        metric_tag = f"_{es_metric_name}={es_metric_value:.4f}"
-    else:
-        metric_tag = ""
-    model_filename = (
-        f"xgboost_{target_col}_{run_id}_seed{random_state}{metric_tag}.pkl"
-    )
+    metric_tag = f"_{es_metric_name}={es_metric_value:.4f}" if es_metric_value is not None else ""
+    model_filename = f"xgboost_{target_col}_{run_id}_seed{random_state}{metric_tag}.pkl"
     model_path = models_path / model_filename
     save_model(model, model_path)
     logger.info("Model saved to: %s", model_path)
