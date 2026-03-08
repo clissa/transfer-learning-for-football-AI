@@ -20,9 +20,9 @@ split:
 
 # Few-shot experiment settings
 fewshot:
-  budgets: [0.01, 0.05, 0.20]           # fraction of target games sampled
+  budgets: [0.05, 0.10, 0.20]           # fraction of target games sampled
   seeds: [1, 2, 3, 4, 5]                # repeat each budget with different seeds
-  source_model_path: "models/xgboost_scores_20260307.pkl"
+  source_model_path: "models/xgboost_scores_20260308_131856_seed836286_recall=0.6717.pkl"
 
 # Source model config (used for target-only from-scratch training)
 model:
@@ -30,7 +30,7 @@ model:
   booster: "gbtree"
   tree_method: "hist"
   device: "cpu"
-  n_estimators: 2000
+  n_estimators: 5000
   learning_rate: 0.03
   verbosity: 1
   n_jobs: -1

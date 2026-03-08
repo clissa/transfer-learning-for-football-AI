@@ -56,11 +56,11 @@ model:
   # Eval and early stopping
   # eval_metric: ["aucpr", "logloss", "auc"]
   # eval_metric: ["logloss", "auc", "aucpr"]
-  eval_metric: ['aucpr', 'auc', 'logloss', 'f1', 'precision', 'recall']
-  early_stopping_rounds: 10
+  eval_metric: ['aucpr', 'auc', 'f1', 'precision', 'recall', 'logloss']
+  early_stopping_rounds: 100
   # Which metric to monitor for early stopping (default: last in eval_metric).
   # Decouples stopping criterion from eval_metric order.
-  early_stopping_metric: "recall"
+  early_stopping_metric: "logloss"
 
   # sklearn wrapper controls
   importance_type: "gain"
@@ -81,5 +81,5 @@ threshold:
   steps: 90
 
 output:
-  dir: "results/train_xgboost_vaep"
+  dir: "results/train_xgboost_vaep_logloss"
   models_dir: "models"
