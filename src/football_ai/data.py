@@ -862,3 +862,489 @@ def _stringify_for_hdf(
 
     return games, players
 
+
+# ──────────────────────────────────────────────
+# Legacy per-competition VAEP pipeline (features_*.h5 / labels_*.h5)
+# ──────────────────────────────────────────────
+
+
+def build_vaep_dataset_for_competition_season(
+    loader: StatsBombLoader,
+    competitions_df: pd.DataFrame,
+    competition_id: int,
+    season_id: int,
+    nb_prev_actions: int = 3,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+    """Build VAEP features and labels for one competition-season."""
+    competition = _competition_row(competitions_df, competition_id, season_id)
+    competition_name = str(competition.competition_name)
+    season_name = str(competition.season_name)
+
+    games = loader.games(competition_id=competition_id, season_id=season_id).copy()
+    if games.empty:
+        raise ValueError("No games found for this competition/season")
+
+    actions_parts: list[pd.DataFrame] = []
+    failed_games: list[tuple[int, str]] = []
+
+    for i, game in games.reset_index(drop=True).iterrows():
+        game_id = int(game.game_id)
+        home_team_id = int(game.home_team_id)
+        try:
+            events = loader.events(game_id)
+            actions = sb_spadl.convert_to_actions(
+                events,
+                home_team_id=home_team_id,
+                xy_fidelity_version=1,
+                shot_fidelity_version=1,
+            )
+            actions_parts.append(actions)
+        except Exception as exc:  # noqa: BLE001
+            failed_games.append((game_id, str(exc)))
+
+        if (i + 1) % 50 == 0:
+            print(
+                f"[{competition_name} | {season_name}] converted {i + 1}/{len(games)} games"
+            )
+
+    if not actions_parts:
+        raise ValueError("No actions were generated (all games failed?)")
+
+    actions = pd.concat(actions_parts, ignore_index=True)
+
+    if "action_id" not in actions.columns:
+        actions = actions.sort_values(["game_id", "period_id", "time_seconds"]).copy()
+        actions["action_id"] = actions.groupby("game_id").cumcount().astype(int)
+
+    if "type_name" not in actions.columns and "type_id" in actions.columns:
+        actiontype_map = dict(enumerate(spadlcfg.actiontypes))
+        actions["type_name"] = actions["type_id"].map(actiontype_map).astype(str)
+
+    actions = actions.merge(games[["game_id", "home_team_id"]], on="game_id", how="left")
+    actions = actions.sort_values(
+        ["game_id", "period_id", "time_seconds", "action_id"]
+    ).reset_index(drop=True)
+    actions = (
+        actions.groupby("game_id", group_keys=False)
+        .apply(
+            lambda game_actions: spadl.play_left_to_right(
+                game_actions.drop(columns=["home_team_id"]),
+                home_team_id=int(game_actions.home_team_id.iloc[0]),
+            )
+        )
+        .reset_index(drop=True)
+    )
+
+    feature_functions = [
+        vaep_features.result_onehot,
+        vaep_features.startlocation,
+        vaep_features.movement,
+        vaep_features.goalscore,
+    ]
+
+    features_parts: list[pd.DataFrame] = []
+    labels_parts: list[pd.DataFrame] = []
+
+    for game_id in games.game_id.astype(int).tolist():
+        game_actions = actions[actions.game_id == game_id].reset_index(drop=True)
+        if game_actions.empty:
+            continue
+
+        game_states = vaep_features.gamestates(game_actions, nb_prev_actions)
+        features_game = pd.concat([fn(game_states) for fn in feature_functions], axis=1)
+        features_game.insert(0, "game_id", game_id)
+        features_game.insert(1, "action_id", game_actions.action_id.astype(int).values)
+        features_parts.append(features_game)
+
+        y_scores = _as_series(vaep_labels.scores(game_actions), "scores")
+        y_concedes = _as_series(vaep_labels.concedes(game_actions), "concedes")
+        labels_game = pd.concat([y_scores, y_concedes], axis=1)
+        labels_game.insert(0, "game_id", game_id)
+        labels_game.insert(1, "action_id", game_actions.action_id.astype(int).values)
+        labels_parts.append(labels_game)
+
+    features_df = pd.concat(features_parts, ignore_index=True) if features_parts else pd.DataFrame()
+    labels_df = pd.concat(labels_parts, ignore_index=True) if labels_parts else pd.DataFrame()
+
+    meta = {
+        "competition_id": int(competition_id),
+        "season_id": int(season_id),
+        "competition_name": competition_name,
+        "season_name": season_name,
+        "games_total": int(len(games)),
+        "games_failed": int(len(failed_games)),
+        "failed_games": failed_games,
+    }
+    return features_df, labels_df, meta
+
+
+def build_and_save_vaep_for_competition_season(
+    loader: StatsBombLoader,
+    competitions_df: pd.DataFrame,
+    output_dir: str | os.PathLike[str],
+    competition_id: int,
+    season_id: int,
+    nb_prev_actions: int = 3,
+) -> tuple[str, str, dict]:
+    """Convenience function: build VAEP dataset and persist it for one competition-season."""
+    competition = _competition_row(competitions_df, competition_id, season_id)
+    competition_name = str(competition.competition_name)
+    season_name = str(competition.season_name)
+
+    features_path, labels_path = output_paths_for_competition_season(
+        output_dir,
+        competition_name,
+        season_name,
+    )
+
+    print(
+        f"\n=== {competition_name} | {season_name} "
+        f"(cid={competition_id}, sid={season_id}) ==="
+    )
+    print(f"-> {features_path}")
+    print(f"-> {labels_path}")
+
+    features_df, labels_df, meta = build_vaep_dataset_for_competition_season(
+        loader=loader,
+        competitions_df=competitions_df,
+        competition_id=competition_id,
+        season_id=season_id,
+        nb_prev_actions=nb_prev_actions,
+    )
+
+    save_vaep_dataset(features_df, labels_df, features_path, labels_path)
+
+    print(f"Saved features: {features_df.shape}")
+    print(f"Saved labels:   {labels_df.shape}")
+    if meta["games_failed"]:
+        print(f"Warning: {meta['games_failed']} games failed conversion")
+
+    return str(features_path), str(labels_path), meta
+
+
+# ──────────────────────────────────────────────
+# Multi-league dataset pipeline (merged H5)
+# ──────────────────────────────────────────────
+
+
+def select_competitions(
+    competitions_df: pd.DataFrame,
+    names: list[str] | None,
+) -> pd.DataFrame:
+    """Select competitions by name. If *names* is None, return all.
+
+    Args:
+        competitions_df: Full competitions table from StatsBombLoader.
+        names: Competition names to keep (None -> keep all).
+
+    Returns:
+        Filtered and sorted competitions DataFrame.
+    """
+    if names is None:
+        selected = competitions_df.copy()
+        print(f"Selected all competitions ({len(selected)})")
+    else:
+        selected = competitions_df[competitions_df["competition_name"].isin(names)].copy()
+        if selected.empty:
+            raise ValueError(f"No competitions found for requested names: {names}")
+
+        found = sorted(selected["competition_name"].dropna().unique().tolist())
+        missing = sorted(set(names) - set(found))
+        print(f"Selected competitions ({len(found)}): {found}")
+        if missing:
+            print(f"Missing competitions ({len(missing)}): {missing}")
+
+    return selected.sort_values(["competition_name", "season_name"]).reset_index(drop=True)
+
+
+def load_games(
+    loader: StatsBombLoader, selected_competitions: pd.DataFrame
+) -> tuple[pd.DataFrame, list[tuple[int, int, str]]]:
+    """Load games for all selected competition/season pairs.
+
+    Returns:
+        (df_games, failed) where *failed* is a list of (cid, sid, error_msg) tuples.
+    """
+    all_games: list[pd.DataFrame] = []
+    failed: list[tuple[int, int, str]] = []
+
+    for comp in selected_competitions.itertuples(index=False):
+        competition_id = int(comp.competition_id)
+        season_id = int(comp.season_id)
+        try:
+            games = loader.games(competition_id=competition_id, season_id=season_id).copy()
+            all_games.append(games)
+            print(
+                f"Loaded {len(games):4d} games for "
+                f"{comp.competition_name} | {comp.season_name} "
+                f"(cid={competition_id}, sid={season_id})"
+            )
+        except Exception as exc:  # noqa: BLE001
+            failed.append((competition_id, season_id, str(exc)))
+            print(f"Could not load games for cid={competition_id}, sid={season_id}: {exc}")
+
+    df_games = pd.concat(all_games, ignore_index=True) if all_games else pd.DataFrame()
+    return df_games, failed
+
+
+def convert_games_to_actions(
+    loader: StatsBombLoader, df_games: pd.DataFrame
+) -> tuple[pd.DataFrame, list[tuple[int, str]]]:
+    """Convert raw StatsBomb events to SPADL actions for every game.
+
+    Returns:
+        (df_actions, failed_games) where *failed_games* lists (game_id, error_msg).
+    """
+    all_actions: list[pd.DataFrame] = []
+    failed_games: list[tuple[int, str]] = []
+
+    games_iter = df_games.reset_index(drop=True)
+    for i, game in games_iter.iterrows():
+        game_id = int(game.game_id)
+        home_team_id = int(game.home_team_id)
+        try:
+            events = loader.events(game_id)
+            actions = sb_spadl.convert_to_actions(
+                events,
+                home_team_id=home_team_id,
+                xy_fidelity_version=1,
+                shot_fidelity_version=1,
+            )
+            all_actions.append(actions)
+        except Exception as exc:  # noqa: BLE001
+            failed_games.append((game_id, str(exc)))
+
+        if (i + 1) % 100 == 0:
+            print(f"Converted {i + 1}/{len(df_games)} games")
+
+    df_actions = pd.concat(all_actions, ignore_index=True) if all_actions else pd.DataFrame()
+    if not df_actions.empty and "action_id" not in df_actions.columns:
+        df_actions = df_actions.sort_values(["game_id", "period_id", "time_seconds"]).copy()
+        df_actions["action_id"] = df_actions.groupby("game_id").cumcount().astype(int)
+
+    return df_actions, failed_games
+
+
+def load_teams_players(
+    loader: StatsBombLoader, game_ids: list[int]
+) -> tuple[pd.DataFrame, pd.DataFrame, list[tuple[int, str]]]:
+    """Load teams and players tables for a list of game ids.
+
+    Returns:
+        (df_teams, df_players, failed) where *failed* lists (game_id, error_msg).
+    """
+    all_teams: list[pd.DataFrame] = []
+    all_players: list[pd.DataFrame] = []
+    failed: list[tuple[int, str]] = []
+
+    for i, game_id in enumerate(game_ids):
+        try:
+            all_teams.append(loader.teams(game_id))
+            all_players.append(loader.players(game_id))
+        except Exception as exc:  # noqa: BLE001
+            failed.append((game_id, str(exc)))
+
+        if (i + 1) % 50 == 0:
+            print(f"Loaded teams/players for {i + 1}/{len(game_ids)} games")
+
+    df_teams = (
+        pd.concat(all_teams, ignore_index=True)
+        .drop_duplicates(subset=["team_id"])
+        .reset_index(drop=True)
+        if all_teams
+        else pd.DataFrame()
+    )
+    df_players = (
+        pd.concat(all_players, ignore_index=True)
+        .drop_duplicates(subset=["player_id"])
+        .reset_index(drop=True)
+        if all_players
+        else pd.DataFrame()
+    )
+    return df_teams, df_players, failed
+
+
+def build_labels(df_actions: pd.DataFrame, df_games: pd.DataFrame) -> pd.DataFrame:
+    """Compute VAEP labels (scores, concedes) for every action.
+
+    Args:
+        df_actions: SPADL actions with columns [game_id, action_id, period_id,
+            time_seconds, type_id, ...].
+        df_games: Games table with [game_id, home_team_id].
+
+    Returns:
+        DataFrame with columns [game_id, action_id, scores, concedes].
+    """
+    if df_actions.empty:
+        return pd.DataFrame(columns=["game_id", "action_id", "scores", "concedes"])
+
+    actions = df_actions.copy()
+    games = df_games.copy()
+
+    if "action_id" not in actions.columns:
+        actions = actions.sort_values(["game_id", "period_id", "time_seconds"]).copy()
+        actions["action_id"] = actions.groupby("game_id").cumcount().astype(int)
+
+    if "type_name" not in actions.columns and "type_id" in actions.columns:
+        actiontype_map = dict(enumerate(spadlcfg.actiontypes))
+        actions["type_name"] = actions["type_id"].map(actiontype_map).astype(str)
+
+    actions = actions.merge(games[["game_id", "home_team_id"]], on="game_id", how="left")
+    actions = actions.sort_values(
+        ["game_id", "period_id", "time_seconds", "action_id"]
+    ).reset_index(drop=True)
+    actions = (
+        actions.groupby("game_id", group_keys=False)
+        .apply(
+            lambda game_actions: spadl.play_left_to_right(
+                game_actions.drop(columns=["home_team_id"]),
+                home_team_id=int(game_actions.home_team_id.iloc[0]),
+            )
+        )
+        .reset_index(drop=True)
+    )
+
+    labels_parts: list[pd.DataFrame] = []
+    for game_id in games.game_id.astype(int).tolist():
+        game_actions = actions[actions.game_id == game_id].reset_index(drop=True)
+        if game_actions.empty:
+            continue
+
+        y_scores = _as_series(vaep_labels.scores(game_actions), "scores")
+        y_concedes = _as_series(vaep_labels.concedes(game_actions), "concedes")
+        labels_game = pd.concat([y_scores, y_concedes], axis=1)
+        labels_game.insert(0, "game_id", game_id)
+        labels_game.insert(1, "action_id", game_actions.action_id.astype(int).values)
+        labels_parts.append(labels_game)
+
+    return pd.concat(labels_parts, ignore_index=True) if labels_parts else pd.DataFrame()
+
+
+def build_merged_output(
+    df_actions: pd.DataFrame,
+    df_games: pd.DataFrame,
+    df_teams: pd.DataFrame,
+    df_players: pd.DataFrame,
+    df_competitions: pd.DataFrame,
+    df_labels: pd.DataFrame,
+    requested_columns: list[str] | None = None,
+) -> pd.DataFrame:
+    """Merge all tables into one wide actions DataFrame with full metadata.
+
+    Args:
+        df_actions: SPADL actions.
+        df_games: Games.
+        df_teams: Teams.
+        df_players: Players.
+        df_competitions: Selected competitions.
+        df_labels: Labels (scores, concedes).
+        requested_columns: Columns to include in the output. If ``None``, uses
+            the module-level :data:`REQUESTED_COLUMNS` default.
+
+    Returns:
+        DataFrame with the requested columns.
+    """
+    if requested_columns is None:
+        requested_columns = REQUESTED_COLUMNS
+
+    df_actions = _ensure_cols_from_index(df_actions, ["game_id", "action_id"])
+    df_games = _ensure_cols_from_index(df_games, ["game_id"])
+    df_teams = _ensure_cols_from_index(df_teams, ["team_id"])
+    df_players = _ensure_cols_from_index(df_players, ["player_id"])
+    df_competitions = _ensure_cols_from_index(df_competitions, ["competition_id", "season_id"])
+    df_labels = _ensure_cols_from_index(df_labels, ["game_id", "action_id"])
+
+    merged_df = pd.merge(df_actions, df_games, on="game_id", how="left")
+
+    df_teams_m = _drop_overlaps(df_teams, merged_df.columns, join_keys={"team_id"})
+    merged_df = pd.merge(merged_df, df_teams_m, on="team_id", how="left")
+
+    df_players_m = _drop_overlaps(df_players, merged_df.columns, join_keys={"player_id"})
+    merged_df = pd.merge(merged_df, df_players_m, on="player_id", how="left")
+
+    df_comp_m = _drop_overlaps(
+        df_competitions,
+        merged_df.columns,
+        join_keys={"competition_id", "season_id"},
+    )
+    merged_df = pd.merge(merged_df, df_comp_m, on=["competition_id", "season_id"], how="left")
+
+    label_cols = [c for c in df_labels.columns if c in {"game_id", "action_id", "scores", "concedes"}]
+    df_labels_m = _drop_overlaps(
+        df_labels[label_cols].copy(), merged_df.columns, join_keys={"game_id", "action_id"}
+    )
+    merged_df = pd.merge(merged_df, df_labels_m, on=["game_id", "action_id"], how="left")
+
+    for col in requested_columns:
+        if col not in merged_df.columns:
+            merged_df[col] = pd.NA
+
+    return merged_df[requested_columns].copy()
+
+
+def build_and_save_dataset(
+    loader: StatsBombLoader,
+    competitions_df: pd.DataFrame,
+    league_names: list[str] | None,
+    output_file: Path,
+    nb_prev_actions: int = 3,
+) -> None:
+    """Build the full dataset for the given leagues and write it to *output_file*.
+
+    Produces a single HDF5 file with keys: ``actions``, ``games``, ``teams``,
+    ``players``, ``competitions``, ``labels``, ``full_data``.
+
+    Args:
+        loader: StatsBomb data loader.
+        competitions_df: All available competitions.
+        league_names: Competition names to include (None -> all available).
+        output_file: Path to the output HDF5 file.
+        nb_prev_actions: Number of previous actions to store as context (default 3).
+    """
+    print(f"\n=== Building dataset: {output_file} ===")
+    selected_competitions = select_competitions(competitions_df, league_names)
+
+    df_games, failed_competitions = load_games(loader, selected_competitions)
+    if df_games.empty:
+        raise ValueError(f"No games loaded for output {output_file}")
+
+    df_actions, failed_actions = convert_games_to_actions(loader, df_games)
+    df_teams, df_players, failed_lineups = load_teams_players(
+        loader, df_games.game_id.astype(int).tolist()
+    )
+    df_labels = build_labels(df_actions, df_games)
+    df_merged = build_merged_output(
+        df_actions=df_actions,
+        df_games=df_games,
+        df_teams=df_teams,
+        df_players=df_players,
+        df_competitions=selected_competitions,
+        df_labels=df_labels,
+    )
+
+    df_games_to_save, df_players_to_save = _stringify_for_hdf(df_games, df_players)
+
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    if output_file.exists():
+        output_file.unlink()
+
+    with pd.HDFStore(str(output_file), mode="w") as store:
+        store.put("actions", df_actions, format="table")
+        store.put("games", df_games_to_save, format="fixed")
+        store.put("teams", df_teams, format="fixed")
+        store.put("players", df_players_to_save, format="table")
+        store.put("competitions", selected_competitions, format="fixed")
+        store.put("labels", df_labels, format="table")
+        store.put("full_data", df_merged, format="table")
+
+    print(f"\nSaved: {output_file}")
+    print(
+        f"  actions={df_actions.shape}  games={df_games.shape}  "
+        f"teams={df_teams.shape}  players={df_players.shape}"
+    )
+    print(f"  labels={df_labels.shape}  full_data={df_merged.shape}")
+    print(
+        f"  failures: competitions={len(failed_competitions)}, "
+        f"actions={len(failed_actions)}, lineups={len(failed_lineups)}"
+    )
+    print(f"  nb_prev_actions={nb_prev_actions} (stored for reference)")
