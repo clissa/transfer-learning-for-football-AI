@@ -33,6 +33,7 @@ python -m scripts.xgboost-few-shots --config configs/xgboost_fewshot.yaml
 from __future__ import annotations
 
 import argparse
+import copy
 import logging
 from pathlib import Path
 from typing import Any
@@ -98,8 +99,13 @@ def parse_args() -> argparse.Namespace:
 # ──────────────────────────────────────────────
 
 def _build_base_model_params(model_cfg: dict[str, Any]) -> dict[str, Any]:
-    """Build XGBClassifier kwargs from config, dropping None values."""
-    return drop_none_params(model_cfg)
+    """Build fresh XGBClassifier kwargs from config, dropping None values.
+
+    XGBoost callback instances are stateful across training runs.  The
+    few-shot loop trains many models sequentially, so we deep-copy nested
+    params (especially ``callbacks``) to avoid callback state leakage.
+    """
+    return copy.deepcopy(drop_none_params(model_cfg))
 
 
 def _train_from_scratch(
