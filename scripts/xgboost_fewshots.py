@@ -51,6 +51,7 @@ from football_ai.training import (
     drop_none_params,
     load_fewshot_splits,
     load_model,
+    resolve_xgb_eval_metrics,
     sample_target_games,
 )
 
@@ -63,7 +64,7 @@ DATA_FILE = Path("data/vaep_data/major_leagues_vaep.h5")
 DATA_KEY = "vaep_data"
 TARGET_COL = "scores"
 
-SOURCE_COMPETITIONS = ["Premier League", "La Liga"]
+SOURCE_COMPETITIONS = ["Premier League", "La Liga", "1. Bunedliga"]
 TARGET_COMPETITIONS = ["Champions League", "UEFA Europa League"]
 VALIDATION_FRAC = 0.2
 RANDOM_STATE: int | None = 20260307
@@ -363,12 +364,40 @@ def main() -> int:
     if args.device:
         base_model_params["device"] = args.device
 
-    # Fine-tune overrides
+    # ── Resolve custom eval metrics for base model (f1, precision, recall → callables) ──
+    early_stopping_metric_model = model_cfg_yaml.get("early_stopping_metric")
+    base_model_params.pop("early_stopping_metric", None)
+    resolved_m, cbs_m, es_rounds_m = resolve_xgb_eval_metrics(
+        base_model_params.get("eval_metric"),
+        early_stopping_rounds=base_model_params.get("early_stopping_rounds"),
+        early_stopping_metric=early_stopping_metric_model,
+    )
+    base_model_params["eval_metric"] = resolved_m
+    base_model_params["early_stopping_rounds"] = es_rounds_m
+    if cbs_m:
+        existing_cbs = base_model_params.get("callbacks") or []
+        base_model_params["callbacks"] = cbs_m + list(existing_cbs)
+
+    # Fine-tune overrides (apply ALL finetune YAML keys, not just a few)
     ft_cfg = cfg.get("finetune", {})
     finetune_params = dict(base_model_params)
-    finetune_params["learning_rate"] = float(ft_cfg.get("learning_rate", 0.01))
-    finetune_params["n_estimators"] = int(ft_cfg.get("n_estimators", 500))
-    finetune_params["early_stopping_rounds"] = int(ft_cfg.get("early_stopping_rounds", 30))
+    for k, v in ft_cfg.items():
+        if v is not None:
+            finetune_params[k] = v
+
+    # ── Resolve custom eval metrics for fine-tune ──
+    early_stopping_metric_ft = ft_cfg.get("early_stopping_metric", early_stopping_metric_model)
+    finetune_params.pop("early_stopping_metric", None)
+    resolved_ft, cbs_ft, es_rounds_ft = resolve_xgb_eval_metrics(
+        finetune_params.get("eval_metric"),
+        early_stopping_rounds=finetune_params.get("early_stopping_rounds"),
+        early_stopping_metric=early_stopping_metric_ft,
+    )
+    finetune_params["eval_metric"] = resolved_ft
+    finetune_params["early_stopping_rounds"] = es_rounds_ft
+    if cbs_ft:
+        existing_ft = finetune_params.get("callbacks") or []
+        finetune_params["callbacks"] = cbs_ft + list(existing_ft)
 
     thr_cfg = cfg.get("threshold", {})
 
