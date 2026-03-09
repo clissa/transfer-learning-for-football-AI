@@ -2,8 +2,8 @@
 # Usage: python -m scripts.tune_xgboost_bayes_v2 --config configs/tune_xgboost.yaml
 
 data:
-  file: "data/spadl_data_rich/major_leagues.h5"
-  key_candidates: ["rich_action", "rich_actions"]
+  file: "data/vaep_data/major_leagues_vaep.h5"
+  key_candidates: "vaep_data"
   target_col: "scores"        # or "concedes"
 
 split:
@@ -17,7 +17,7 @@ optuna:
 
 training:
   n_estimators: 20000
-  early_stopping_rounds: 200
+  early_stopping_rounds: 100
   base_params:
     booster: "gbtree"
     tree_method: "hist"

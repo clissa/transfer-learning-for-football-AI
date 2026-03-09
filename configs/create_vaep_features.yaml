@@ -1,9 +1,13 @@
 # Configuration for scripts/create_vaep_features.py
 # Usage: python -m scripts.create_vaep_features --config configs/create_vaep_features.yaml
 
-input_file: "data/spadl_full_data/major_leagues.h5"
+input_file: "data/spadl_full_data/all_leagues.h5"
+# input_file: "data/spadl_full_data/major_leagues.h5"
+# input_file: "data/spadl_full_data/women_leagues.h5"
 input_key: "full_data"
 output_dir: "data/vaep_data"
-outname: "major_leagues_vaep.h5"
+outname: "all_leagues_vaep.h5"
+# outname: "major_leagues_vaep.h5"
+# outname: "women_leagues_vaep.h5"
 output_key: "vaep_data"
 nb_prev_actions: 3

@@ -3,10 +3,16 @@
 
 data_root: "../open-data/data"
 output_dir: "data/spadl_data"
-outname: "major_leagues.h5"
+outname: "all_leagues.h5"
+# outname: "major_leagues.h5"
+# outname: "women_leagues.h5"
+
 nb_prev_actions: 3
 
-leagues:
+# Set to true to include ALL available competitions (overrides leagues list)
+all_leagues: true # all leagues
+
+leagues: # major leagues 
   - "La Liga"
   - "Serie A"
   - "Premier League"
@@ -15,5 +21,7 @@ leagues:
   - "Champions League"
   - "UEFA Europa League"
 
-# Set to true to include ALL available competitions (overrides leagues list)
-# all_leagues: false
+# leagues: # women's leagues
+#   - "FA Women's Super League"
+#   - "Women's World Cup"
+#   - "UEFA Women's Euro"

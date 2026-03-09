@@ -13,16 +13,21 @@ data:
   target_col: "scores"        # or "concedes"
 
 split:
-  source_competitions: ["Premier League", "La Liga"]
-  target_competitions: ["Champions League", "UEFA Europa League"]
+  source_competitions: ["Premier League", "La Liga", "1. Bundeliga"]
+  target_competitions: ["Serie A", "Ligue 1", "Champions League", "UEFA Europa League"]
   validation_frac: 0.2        # source train/val split fraction
   random_state: 20260307
 
 # Few-shot experiment settings
 fewshot:
-  budgets: [0.05, 0.10, 0.20]           # fraction of target games sampled
-  seeds: [1, 2, 3, 4, 5]                # repeat each budget with different seeds
-  source_model_path: "models/xgboost_scores_20260308_131856_seed836286_recall=0.6717.pkl"
+  budgets: [0.10, 0.20, 0.3]           # fraction of target games sampled
+  seeds: [19920402, 19901229, 19921020, 20250726, 20100522]                # repeat each budget with different seeds
+  source_model_path: "models/xgboost_scores_20260308_223630_seed129799_auc=0.8127.pkl"
+  # source_model_path: "models/xgboost_scores_20260308_215132_seed982977_logloss=0.0642.pkl"
+  # source_model_path: "models/xgboost_scores_20260308_212208_seed210501_logloss=0.1133.pkl"
+  # source_model_path: "models/xgboost_scores_20260308_163459_seed777827_auc=0.8263.pkl"
+  # source_model_path: "models/xgboost_scores_20260308_151248_seed23012_logloss=0.3638.pkl"
+  # source_model_path: "models/xgboost_scores_20260308_131856_seed836286_recall=0.6717.pkl"
 
 # Source model config (used for target-only from-scratch training)
 model:
@@ -30,29 +35,29 @@ model:
   booster: "gbtree"
   tree_method: "hist"
   device: "cpu"
-  n_estimators: 5000
+  n_estimators: 500
   learning_rate: 0.03
   verbosity: 1
   n_jobs: -1
 
-  max_depth: 6
-  max_bin: 256
-  grow_policy: "depthwise"
-  gamma: 0.0
-  min_child_weight: 1.0
+  max_depth: 8
+  # max_bin: 256
+  grow_policy: "lossguide"
+  # gamma: 0.0
+  # min_child_weight: 1.0
   max_delta_step: 1.0
 
   subsample: 0.8
-  sampling_method: "uniform"
+  sampling_method: "gradient_based"
   colsample_bytree: 0.8
-  colsample_bylevel: 1.0
-  colsample_bynode: 1.0
+  colsample_bylevel: 0.6
+  colsample_bynode: 0.6
 
-  reg_alpha: 0.0
-  reg_lambda: 1.0
-  scale_pos_weight: 80
+  reg_alpha: 0.5
+  reg_lambda: 2
+  scale_pos_weight: 20
 
-  eval_metric: ["aucpr", "auc", "logloss"]
+  eval_metric: ["aucpr", "auc", "logloss"] #, "f1", "precision", "recall"]
   early_stopping_rounds: 50
 
   importance_type: "gain"
@@ -61,15 +66,34 @@ model:
 # Fine-tuning overrides (warm-start from source model)
 finetune:
   learning_rate: 0.01          # reduced LR for gentle adaptation
-  n_estimators: 500            # fewer additional boosting rounds
-  early_stopping_rounds: 30
+  n_estimators: 200            # fewer additional boosting rounds
+  early_stopping_rounds: 20
+  max_depth: 8
+  # max_bin: 256
+  grow_policy: "lossguide"
+  # gamma: 
+  # min_child_weight: 5.0
+  max_delta_step: 2.0
 
+  subsample: 0.6
+  sampling_method: "gradient_based"
+  colsample_bytree: 0.8
+  colsample_bylevel: 0.8
+  colsample_bynode: 0.8
+
+  reg_alpha: 0.5
+  reg_lambda: 2
+  scale_pos_weight: 20
+
+  eval_metric: ["aucpr", "auc", "logloss"] #, "f1", "precision", "recall"]
+
+  
 threshold:
   enabled: true
   pred_threshold: 0.5
-  min: 0.05
-  max: 0.95
-  steps: 90
+  min: 0.35
+  max: 0.65
+  steps: 30
 
 output:
-  dir: "results/fewshot_xgboost"
+  dir: "results/fewshot_xgboost_auc-1-refined-3_10-20-30"

@@ -30,7 +30,7 @@ split:
 
 # Few-shot experiment settings
 fewshot:
-  budgets: [0.10, 0.20, 0.3]           # fraction of target games sampled
+  budgets: [0.05, 0.15, 0.30, 0.50]           # fraction of target games sampled
   seeds: [19920402, 19901229, 19921020, 20250726, 20100522]                # repeat each budget with different seeds
   source_model_path: "models/xgboost_scores_20260309_094743_seed761136_auc=0.8099.pkl"
 
@@ -71,8 +71,11 @@ model:
 
 # Fine-tuning overrides (warm-start from source model)
 finetune:
-  learning_rate: 0.01          # reduced LR for gentle adaptation
-  n_estimators: 500            # fewer additional boosting rounds
+  n_estimators: 1000            # fewer additional boosting rounds
+  learning_rate: 0.02          # reduced LR for gentle adaptation
+  verbosity: 1
+  n_jobs: 16
+
   max_depth: 8
   # max_bin: 256
   grow_policy: "lossguide"
@@ -80,7 +83,7 @@ finetune:
   # min_child_weight: 5.0
   max_delta_step: 2.0
 
-  subsample: 0.6
+  subsample: 0.8
   sampling_method: "gradient_based"
   colsample_bytree: 0.8
   colsample_bylevel: 0.6
@@ -91,7 +94,7 @@ finetune:
   scale_pos_weight: 20
 
   eval_metric: ['aucpr', 'auc', 'logloss', 'f1', 'precision', 'recall']
-  early_stopping_rounds: 20
+  early_stopping_rounds: 50
   early_stopping_metric: "auc"
   
 threshold:
@@ -102,4 +105,4 @@ threshold:
   steps: 30
 
 output:
-  dir: "results/all_leagues/fewshot_xgboost_auc_10-20-30"
+  dir: "results/all_leagues/fewshot_xgboost_auc-lossiwise-allsame_5-15-30-50"
