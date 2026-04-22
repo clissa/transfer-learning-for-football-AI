@@ -360,6 +360,7 @@ def main() -> int:
         "scale_pos_weight": 80,
         "eval_metric": ["aucpr", "auc", "logloss"],
         "early_stopping_rounds": 50,
+        "enable_categorical": True,
         "importance_type": "gain",
         "validate_parameters": True,
     }
@@ -451,7 +452,7 @@ def main() -> int:
     pretrained_model: XGBClassifier = load_model(source_model_path)
 
     # Align source-val columns for threshold selection
-    X_source_val_aligned = X_source_val.reindex(columns=feature_cols, fill_value=0)
+    X_source_val_aligned = X_source_val.reindex(columns=feature_cols)
 
     # Find threshold on source val (used for all zero-shot evals)
     source_threshold = _select_threshold(
@@ -502,9 +503,9 @@ def main() -> int:
                 X_few_val = X_few.loc[val_mask]
                 y_few_val = y_few.loc[val_mask]
 
-            X_few_train = X_few_train.reindex(columns=feature_cols, fill_value=0)
-            X_few_val = X_few_val.reindex(columns=feature_cols, fill_value=0)
-            X_hold = X_hold.reindex(columns=feature_cols, fill_value=0)
+            X_few_train = X_few_train.reindex(columns=feature_cols)
+            X_few_val = X_few_val.reindex(columns=feature_cols)
+            X_hold = X_hold.reindex(columns=feature_cols)
 
             # ── 0) Source-only (zero-shot on same holdout) ──
             combo_i += 1

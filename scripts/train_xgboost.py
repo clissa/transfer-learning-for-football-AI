@@ -171,7 +171,7 @@ XGB_MODEL_CONFIG: dict[str, Any] = {
     "interaction_constraints": None,
 
     # Categorical handling
-    "enable_categorical": False,
+    "enable_categorical": True,
     "feature_types": None,
     "max_cat_to_onehot": None,
     "max_cat_threshold": None,
@@ -329,10 +329,6 @@ def main() -> int:
     X_target = resolved_split.target.X
     y_target = resolved_split.target.y
 
-    X_train = X_train.astype(np.float32)
-    X_val = X_val.astype(np.float32)
-    X_calib = X_calib.astype(np.float32)
-    X_target = X_target.astype(np.float32)
     y_train = y_train.astype(np.uint8)
     y_val = y_val.astype(np.uint8)
     y_calib = y_calib.astype(np.uint8)
@@ -407,15 +403,15 @@ def main() -> int:
     logger.info("Model saved to: %s", model_path)
     
     evaluation_frames: list[tuple[str, str, pd.DataFrame, pd.Series]] = [
-        ("train", "in-sample", X_train.reindex(columns=train_feature_cols, fill_value=0), y_train),
-        ("validation", "in-sample", X_val.reindex(columns=train_feature_cols, fill_value=0), y_val),
+        ("train", "in-sample", X_train.reindex(columns=train_feature_cols), y_train),
+        ("validation", "in-sample", X_val.reindex(columns=train_feature_cols), y_val),
     ]
     for test_name, split_frame in resolved_split.test.items():
         evaluation_frames.append(
             (
                 f"test_{test_name}",
                 test_name.replace("_", "-"),
-                split_frame.X.reindex(columns=train_feature_cols, fill_value=0),
+                split_frame.X.reindex(columns=train_feature_cols),
                 split_frame.y.astype(np.uint8),
             )
         )
@@ -424,7 +420,7 @@ def main() -> int:
             (
                 "target",
                 "residual-target",
-                resolved_split.target.X.reindex(columns=train_feature_cols, fill_value=0),
+                resolved_split.target.X.reindex(columns=train_feature_cols),
                 resolved_split.target.y.astype(np.uint8),
             )
         )

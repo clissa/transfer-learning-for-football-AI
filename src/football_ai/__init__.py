@@ -90,6 +90,7 @@ from .features import (
 from .training import (
     ResolvedCompetitionSeasonSplit,
     ResolvedSplitFrame,
+    build_scores_xgb_feature_frame,
     build_models,
     build_param_grids,
     build_preprocessor,
@@ -104,6 +105,7 @@ from .training import (
     load_xy_competition_split,
     load_xy_game_split,
     load_xy_source_calib_target_split,
+    prepare_vaep_xgb_features,
     preprocess_split,
     resolve_competition_season_split_spec,
     resolve_season_aliases,
@@ -205,6 +207,7 @@ __all__ = [
     # training
     "ResolvedCompetitionSeasonSplit",
     "ResolvedSplitFrame",
+    "build_scores_xgb_feature_frame",
     "build_models",
     "build_param_grids",
     "build_preprocessor",
@@ -219,6 +222,7 @@ __all__ = [
     "load_xy_competition_split",
     "load_xy_game_split",
     "load_xy_source_calib_target_split",
+    "prepare_vaep_xgb_features",
     "preprocess_split",
     "resolve_competition_season_split_spec",
     "resolve_season_aliases",

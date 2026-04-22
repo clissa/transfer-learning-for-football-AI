@@ -19,7 +19,7 @@ from football_ai.evaluation import (
     evaluate_binary_with_baselines,
     get_positive_class_scores,
 )
-from football_ai.training import select_vaep_feature_cols
+from football_ai.training import prepare_vaep_xgb_features
 
 # ═══════════════════════════════════════════════
 # Configurable globals
@@ -67,8 +67,7 @@ def main() -> None:
         raise ValueError("No rows found for TARGET_COMPETITIONS")
 
     # ── Features / labels ──────────────────────
-    feature_cols = select_vaep_feature_cols(df_target.columns)
-    X_target = df_target[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0)
+    X_target, _, _ = prepare_vaep_xgb_features(df_target, target_col=TARGET_COL)
     y_target = df_target[TARGET_COL].astype(int)
 
     # ── Load model ─────────────────────────────

@@ -31,9 +31,11 @@ from football_ai.data import (
 )
 from football_ai.evaluation import evaluate_binary, get_positive_class_scores
 from football_ai.training import (
+    build_scores_xgb_feature_frame,
     build_sklearn_model,
     build_preprocessor,
     load_xy_competition_season_split,
+    prepare_vaep_xgb_features,
     preprocess_split,
     resolve_competition_season_split_spec,
     resolve_season_aliases,
@@ -264,6 +266,149 @@ def test_build_preprocessor_and_preprocess():
 
 
 @pytest.fixture
+def scores_feature_refactor_df():
+    rows: list[dict[str, object]] = []
+    team_sequence = [11, 11, 11, 22, 22]
+    action_slots = [
+        ("pass", None, None),
+        ("pass", "pass", None),
+        ("shot", "pass", "pass"),
+        ("pass", "shot", "pass"),
+        ("shot", "pass", "shot"),
+    ]
+    result_slots = [
+        ("success", None, None),
+        ("success", "success", None),
+        ("fail", "success", "success"),
+        ("success", "fail", "success"),
+        ("success", "success", "fail"),
+    ]
+    bodypart_slots = [
+        ("foot", None, None),
+        ("foot", "foot", None),
+        ("head", "foot", "foot"),
+        ("foot", "head", "foot"),
+        ("head", "foot", "head"),
+    ]
+
+    for action_id, team_id in enumerate(team_sequence):
+        row: dict[str, object] = {
+            "game_id": 1,
+            "action_id": action_id,
+            "team_id": team_id,
+            "competition_name": "La Liga",
+            "season_name": "2015/2016",
+            "season_id": 101,
+            "scores": int(action_id in {2, 4}),
+            "concedes": 0,
+            "start_x_a0": 60.0 + action_id,
+            "start_y_a0": 34.0 + (action_id % 2),
+            "end_x_a0": 70.0 + action_id,
+            "end_y_a0": 33.0 + (action_id % 2),
+            "start_x_a1": 58.0 + action_id,
+            "start_y_a1": 33.0,
+            "start_x_a2": 56.0 + action_id,
+            "start_y_a2": 32.0,
+            "end_x_a1": 67.0 + action_id,
+            "end_y_a1": 33.0,
+            "end_x_a2": 65.0 + action_id,
+            "end_y_a2": 32.0,
+            "dx_a0": 10.0,
+            "dy_a0": -1.0,
+            "movement_a0": 10.05,
+            "dx_a1": 9.0,
+            "dy_a1": 0.0,
+            "movement_a1": 9.0,
+            "dx_a2": 8.0,
+            "dy_a2": 1.0,
+            "movement_a2": 8.06,
+            "dx_a01": 2.0,
+            "dy_a01": 1.0,
+            "mov_a01": 2.24,
+            "dx_a02": 4.0,
+            "dy_a02": 2.0,
+            "mov_a02": 4.47,
+            "goalscore_team": 0,
+            "goalscore_opponent": 0,
+            "goalscore_diff": 0,
+            "period_id_a0": 1,
+            "time_seconds_a0": 30.0 * action_id,
+            "time_seconds_overall_a0": 30.0 * action_id,
+            "period_id_a1": 1,
+            "time_seconds_a1": max(0.0, 30.0 * (action_id - 1)),
+            "time_seconds_overall_a1": max(0.0, 30.0 * (action_id - 1)),
+            "period_id_a2": 1,
+            "time_seconds_a2": max(0.0, 30.0 * (action_id - 2)),
+            "time_seconds_overall_a2": max(0.0, 30.0 * (action_id - 2)),
+        }
+        for slot_idx, slot in enumerate(("a0", "a1", "a2")):
+            action_name = action_slots[action_id][slot_idx]
+            result_name = result_slots[action_id][slot_idx]
+            bodypart_name = bodypart_slots[action_id][slot_idx]
+            row[f"actiontype_pass_{slot}"] = int(action_name == "pass")
+            row[f"actiontype_shot_{slot}"] = int(action_name == "shot")
+            row[f"result_success_{slot}"] = int(result_name == "success")
+            row[f"result_fail_{slot}"] = int(result_name == "fail")
+            row[f"bodypart_foot_{slot}"] = int(bodypart_name == "foot")
+            row[f"bodypart_head_{slot}"] = int(bodypart_name == "head")
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def test_build_scores_xgb_feature_frame_decodes_categories_and_possession(scores_feature_refactor_df):
+    X, feature_cols, categorical_cols = build_scores_xgb_feature_frame(scores_feature_refactor_df)
+
+    assert feature_cols == list(X.columns)
+    assert categorical_cols == [
+        "actiontype_a0", "actiontype_a1", "actiontype_a2",
+        "result_a0", "result_a1", "result_a2",
+        "bodypart_a0", "bodypart_a1", "bodypart_a2",
+    ]
+    assert str(X["actiontype_a0"].dtype) == "category"
+    assert str(X["result_a1"].dtype) == "category"
+    assert str(X["bodypart_a2"].dtype) == "category"
+    assert X.loc[0, "actiontype_a0"] == "pass"
+    assert pd.isna(X.loc[0, "actiontype_a1"])
+    assert X.loc[2, "actiontype_a2"] == "pass"
+    assert X.loc[2, "result_a0"] == "fail"
+    assert X.loc[2, "bodypart_a0"] == "head"
+
+    assert np.isclose(
+        X.loc[0, "start_dist_to_goal"] - X.loc[0, "end_dist_to_goal"],
+        X.loc[0, "dist_to_goal_delta"],
+    )
+    assert X["start_angle_to_goal"].gt(0).all()
+    assert X["end_angle_to_goal"].gt(0).all()
+    assert X["in_final_third"].isin([0, 1]).all()
+    assert X["start_in_box"].isin([0, 1]).all()
+    assert X["end_in_box"].isin([0, 1]).all()
+
+    assert X["possession_chain_len"].tolist() == [1, 2, 3, 1, 2]
+    assert X["same_team_a01"].tolist() == [0, 1, 1, 0, 1]
+    assert X["same_team_a12"].tolist() == [0, 0, 1, 1, 0]
+    assert X["same_team_a02"].tolist() == [0, 0, 1, 0, 0]
+    assert X["turnover_a01"].tolist() == [0, 0, 0, 1, 0]
+    assert X["turnover_a12"].tolist() == [0, 0, 0, 0, 1]
+
+
+def test_prepare_vaep_xgb_features_preserves_scores_categoricals(scores_feature_refactor_df):
+    X, feature_cols, categorical_cols = prepare_vaep_xgb_features(
+        scores_feature_refactor_df,
+        target_col="scores",
+    )
+
+    assert feature_cols == list(X.columns)
+    assert categorical_cols
+    assert "actiontype_pass_a0" not in X.columns
+    assert "result_success_a1" not in X.columns
+    assert "bodypart_head_a2" not in X.columns
+    assert "actiontype_a0" in X.columns
+    assert "same_team_a01" in X.columns
+    assert "possession_chain_len" in X.columns
+    assert str(X["actiontype_a0"].dtype) == "category"
+
+
+@pytest.fixture
 def split_refactor_df():
     rows: list[dict[str, object]] = []
     competitions = {
@@ -293,6 +438,7 @@ def split_refactor_df():
                 rows.append({
                     "game_id": game_id,
                     "action_id": action_id,
+                    "team_id": 10 + (game_id % 2),
                     "competition_name": competition_name,
                     "season_name": season_name,
                     "season_id": season_id,
@@ -302,7 +448,59 @@ def split_refactor_df():
                     "start_y_a0": float(season_id % 100) + action_id,
                     "end_x_a0": float(game_id % 50) + action_id,
                     "end_y_a0": float(season_id % 50) + action_id,
+                    "start_x_a1": float(game_id % 100) + max(0, action_id - 1),
+                    "start_y_a1": float(season_id % 100) + max(0, action_id - 1),
+                    "start_x_a2": float(game_id % 100) + max(0, action_id - 2),
+                    "start_y_a2": float(season_id % 100) + max(0, action_id - 2),
+                    "end_x_a1": float(game_id % 50) + max(0, action_id - 1),
+                    "end_y_a1": float(season_id % 50) + max(0, action_id - 1),
+                    "end_x_a2": float(game_id % 50) + max(0, action_id - 2),
+                    "end_y_a2": float(season_id % 50) + max(0, action_id - 2),
+                    "dx_a0": 1.0,
+                    "dy_a0": 1.0,
+                    "movement_a0": 1.414,
+                    "dx_a1": 1.0,
+                    "dy_a1": 0.0,
+                    "movement_a1": 1.0,
+                    "dx_a2": 0.0,
+                    "dy_a2": 1.0,
+                    "movement_a2": 1.0,
+                    "dx_a01": 1.0,
+                    "dy_a01": 1.0,
+                    "mov_a01": 1.414,
+                    "dx_a02": 2.0,
+                    "dy_a02": 2.0,
+                    "mov_a02": 2.828,
                     "goalscore_diff": float((action_id % 3) - 1),
+                    "goalscore_team": 0.0,
+                    "goalscore_opponent": 0.0,
+                    "period_id_a0": 1,
+                    "time_seconds_a0": float(action_id * 30),
+                    "time_seconds_overall_a0": float(action_id * 30),
+                    "period_id_a1": 1,
+                    "time_seconds_a1": float(max(0, action_id - 1) * 30),
+                    "time_seconds_overall_a1": float(max(0, action_id - 1) * 30),
+                    "period_id_a2": 1,
+                    "time_seconds_a2": float(max(0, action_id - 2) * 30),
+                    "time_seconds_overall_a2": float(max(0, action_id - 2) * 30),
+                    "actiontype_pass_a0": int(action_id % 2 == 0),
+                    "actiontype_shot_a0": int(action_id % 2 == 1),
+                    "actiontype_pass_a1": int(action_id % 2 == 0),
+                    "actiontype_shot_a1": int(action_id % 2 == 1),
+                    "actiontype_pass_a2": int(action_id % 2 == 0),
+                    "actiontype_shot_a2": int(action_id % 2 == 1),
+                    "result_success_a0": 1,
+                    "result_fail_a0": 0,
+                    "result_success_a1": 1,
+                    "result_fail_a1": 0,
+                    "result_success_a2": 1,
+                    "result_fail_a2": 0,
+                    "bodypart_foot_a0": 1,
+                    "bodypart_head_a0": 0,
+                    "bodypart_foot_a1": 1,
+                    "bodypart_head_a1": 0,
+                    "bodypart_foot_a2": 1,
+                    "bodypart_head_a2": 0,
                 })
             game_id += 1
     return pd.DataFrame(rows)
