@@ -6,6 +6,8 @@ Scripts in ``scripts/`` are thin CLI wrappers that call into these functions.
 from __future__ import annotations
 
 import logging
+import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -26,9 +28,69 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from tqdm.auto import tqdm
 
-from .data import load_dataset_tables, load_xy, read_h5_table, split_dataset_key
+from .data import (
+    load_dataset_tables,
+    load_xy,
+    parse_season_sort_key,
+    read_h5_table,
+    split_dataset_key,
+)
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ResolvedSplitFrame:
+    """Materialized features, labels, and metadata for one named split."""
+
+    name: str
+    df: pd.DataFrame
+    X: pd.DataFrame
+    y: pd.Series
+    competition_seasons: pd.DataFrame
+
+    @property
+    def competitions(self) -> list[str]:
+        if self.competition_seasons.empty:
+            return []
+        return sorted(self.competition_seasons["competition_name"].astype(str).unique().tolist())
+
+    @property
+    def season_names(self) -> list[str]:
+        if self.competition_seasons.empty:
+            return []
+        seasons = self.competition_seasons["season_name"].astype(str).unique().tolist()
+        return sorted(seasons, key=parse_season_sort_key)
+
+    @property
+    def n_games(self) -> int:
+        if self.df.empty or "game_id" not in self.df.columns:
+            return 0
+        return int(self.df["game_id"].nunique())
+
+
+@dataclass
+class ResolvedCompetitionSeasonSplit:
+    """Structured train/calib/test/target view for competition-season experiments."""
+
+    source_train: ResolvedSplitFrame
+    source_val: ResolvedSplitFrame
+    calib: ResolvedSplitFrame
+    target: ResolvedSplitFrame
+    test: dict[str, ResolvedSplitFrame]
+    feature_cols: list[str]
+    split_config: dict[str, Any]
+
+    def named_splits(self) -> dict[str, ResolvedSplitFrame]:
+        splits = {
+            "source_train": self.source_train,
+            "source_val": self.source_val,
+            "calib": self.calib,
+            "target": self.target,
+        }
+        for name, split in self.test.items():
+            splits[f"test_{name}"] = split
+        return splits
 
 
 # ──────────────────────────────────────────────
@@ -676,6 +738,313 @@ def load_xy_competition_split(
         X_val, y_val,
         X_test, y_test,
         sorted(train_set), sorted(val_set), sorted(test_set),
+    )
+
+
+def _as_string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    return [str(item) for item in value]
+
+
+def _canonicalize_season_tokens(season_value: str) -> set[str]:
+    text = str(season_value).strip()
+    lowered = text.lower().replace(" ", "")
+    tokens = {lowered}
+    match = re.search(r"(?P<start>\d{4})\s*[-/]\s*(?P<end>\d{2,4})", lowered)
+    if not match:
+        return tokens
+
+    start_year = int(match.group("start"))
+    end_raw = match.group("end")
+    end_year = int(end_raw) if len(end_raw) == 4 else (start_year // 100) * 100 + int(end_raw)
+    tokens.update({
+        f"{start_year}/{end_year:04d}",
+        f"{start_year}-{end_year:04d}",
+        f"{start_year}/{end_year % 100:02d}",
+        f"{start_year}-{end_year % 100:02d}",
+    })
+    return tokens
+
+
+def resolve_season_aliases(
+    available_seasons: Sequence[str],
+    requested_seasons: Sequence[str],
+) -> list[str]:
+    """Resolve user-friendly season specs against canonical dataset labels."""
+    if not requested_seasons:
+        return []
+
+    available = [str(season) for season in available_seasons]
+    resolved: list[str] = []
+    for requested in requested_seasons:
+        requested_tokens = _canonicalize_season_tokens(str(requested))
+        matches = [
+            season for season in available
+            if requested_tokens & _canonicalize_season_tokens(season)
+        ]
+        unique_matches = sorted(set(matches), key=lambda season: str(season))
+        if not unique_matches:
+            raise ValueError(
+                f"Could not resolve requested season {requested!r} from available seasons: {sorted(set(available))}"
+            )
+        if len(unique_matches) > 1:
+            raise ValueError(
+                f"Season spec {requested!r} is ambiguous; matches={unique_matches}"
+            )
+        resolved.append(unique_matches[0])
+
+    return sorted(set(resolved), key=parse_season_sort_key)
+
+
+def _validate_requested_competitions(
+    requested_competitions: Sequence[str],
+    available_competitions: Sequence[str],
+    label: str,
+) -> list[str]:
+    requested = [str(comp) for comp in requested_competitions]
+    available_set = {str(comp) for comp in available_competitions}
+    missing = sorted(set(requested) - available_set)
+    if missing:
+        raise ValueError(f"{label} contains unknown competitions: {missing}")
+    return requested
+
+
+def _build_competition_season_coverage(df: pd.DataFrame) -> pd.DataFrame:
+    cols = ["competition_name", "season_name"]
+    agg: dict[str, tuple[str, str]] = {}
+    if "season_id" in df.columns:
+        agg["season_id"] = ("season_id", "first")
+    if "competition_id" in df.columns:
+        agg["competition_id"] = ("competition_id", "first")
+    agg["rows"] = ("game_id", "size")
+    agg["games"] = ("game_id", "nunique")
+
+    if df.empty:
+        empty_cols = cols + list(agg.keys())
+        return pd.DataFrame(columns=empty_cols)
+
+    coverage = (
+        df.groupby(cols, dropna=False)
+        .agg(**agg)
+        .reset_index()
+        .sort_values(["competition_name", "season_name"])
+        .reset_index(drop=True)
+    )
+    return coverage
+
+
+def _build_split_frame(
+    name: str,
+    frame: pd.DataFrame,
+    target_col: str,
+    feature_cols: Sequence[str],
+) -> ResolvedSplitFrame:
+    X = frame.loc[:, list(feature_cols)].replace([np.inf, -np.inf], np.nan).fillna(0)
+    y = frame[target_col].astype(int) if target_col in frame.columns else pd.Series(dtype=int)
+    coverage = _build_competition_season_coverage(frame)
+    return ResolvedSplitFrame(name=name, df=frame.copy(), X=X, y=y, competition_seasons=coverage)
+
+
+def resolve_competition_season_split_spec(
+    df: pd.DataFrame,
+    split_config: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Resolve source/calib/test/target membership at competition-season level."""
+    required_columns = {"competition_name", "season_name", "season_id", "game_id"}
+    missing_columns = required_columns - set(df.columns)
+    if missing_columns:
+        raise KeyError(f"Expected dataset columns for competition-season split: {sorted(missing_columns)}")
+
+    df_local = df.copy()
+    df_local["competition_name"] = df_local["competition_name"].astype(str)
+    df_local["season_name"] = df_local["season_name"].astype(str)
+
+    split_cfg = dict(split_config)
+    source_cfg = dict(split_cfg.get("source", {}))
+    calib_cfg = dict(split_cfg.get("calib", {}))
+    test_cfg = dict(split_cfg.get("test", {}))
+
+    if not source_cfg and "source_competitions" in split_cfg:
+        source_cfg = {"competitions": split_cfg.get("source_competitions", [])}
+    if not calib_cfg and "calib_competitions" in split_cfg:
+        calib_cfg = {"competitions": split_cfg.get("calib_competitions", [])}
+    if not test_cfg and "target_competitions" in split_cfg:
+        test_cfg = {"competitions": split_cfg.get("target_competitions", [])}
+
+    source_competitions = _validate_requested_competitions(
+        _as_string_list(source_cfg.get("competitions", [])),
+        df_local["competition_name"].dropna().unique().tolist(),
+        "source.competitions",
+    )
+    calib_competitions = _validate_requested_competitions(
+        _as_string_list(calib_cfg.get("competitions", split_cfg.get("calib_competitions", []))),
+        df_local["competition_name"].dropna().unique().tolist(),
+        "calib.competitions",
+    )
+    test_competitions = _validate_requested_competitions(
+        _as_string_list(test_cfg.get("competitions", split_cfg.get("target_competitions", []))),
+        df_local["competition_name"].dropna().unique().tolist(),
+        "test.competitions",
+    )
+
+    exclude_specs = _as_string_list(source_cfg.get("exclude_seasons", []))
+    year_shift_cfg = dict(test_cfg.get("year_shift", {}))
+    year_shift_specs = _as_string_list(year_shift_cfg.get("seasons", exclude_specs))
+    explicit_cfg = dict(test_cfg.get("league_season_shift", {}))
+    explicit_map = explicit_cfg.get("explicit", {}) or {}
+
+    available_by_comp = {
+        competition: sorted(
+            df_local.loc[df_local["competition_name"] == competition, "season_name"].dropna().astype(str).unique().tolist(),
+        )
+        for competition in sorted(df_local["competition_name"].dropna().astype(str).unique().tolist())
+    }
+
+    excluded_keys: set[tuple[str, str]] = set()
+    year_shift_keys: set[tuple[str, str]] = set()
+    for competition in source_competitions:
+        resolved_excluded = resolve_season_aliases(available_by_comp[competition], exclude_specs)
+        resolved_year_shift = resolve_season_aliases(available_by_comp[competition], year_shift_specs)
+        excluded_keys.update((competition, season) for season in resolved_excluded)
+        year_shift_keys.update((competition, season) for season in resolved_year_shift)
+
+    source_keys = {
+        (str(row.competition_name), str(row.season_name))
+        for row in (
+            df_local.loc[df_local["competition_name"].isin(source_competitions), ["competition_name", "season_name"]]
+            .drop_duplicates()
+            .itertuples(index=False)
+        )
+    } - excluded_keys - year_shift_keys
+
+    if not source_keys:
+        raise ValueError("Resolved source competition-season set is empty")
+
+    source_seasons = {season for _, season in source_keys}
+    non_source_test_competitions = sorted(set(test_competitions) - set(source_competitions))
+    test_rows = df_local.loc[df_local["competition_name"].isin(non_source_test_competitions), ["competition_name", "season_name"]]
+    test_keys = {
+        (str(row.competition_name), str(row.season_name))
+        for row in test_rows.drop_duplicates().itertuples(index=False)
+    }
+    league_shift_keys = {key for key in test_keys if key[1] in source_seasons}
+    league_season_shift_keys = test_keys - league_shift_keys
+
+    for competition, season_specs in explicit_map.items():
+        _validate_requested_competitions([competition], df_local["competition_name"].dropna().unique().tolist(), "test.league_season_shift.explicit")
+        resolved_seasons = resolve_season_aliases(available_by_comp[str(competition)], _as_string_list(season_specs))
+        league_season_shift_keys.update((str(competition), season_name) for season_name in resolved_seasons)
+
+    overlap_with_source = source_keys & (year_shift_keys | league_shift_keys | league_season_shift_keys)
+    if overlap_with_source:
+        raise ValueError(f"Resolved source overlap with non-source split(s): {sorted(overlap_with_source)}")
+
+    calib_keys = {
+        (str(row.competition_name), str(row.season_name))
+        for row in (
+            df_local.loc[df_local["competition_name"].isin(calib_competitions), ["competition_name", "season_name"]]
+            .drop_duplicates()
+            .itertuples(index=False)
+        )
+    }
+    source_calib_overlap = source_keys & calib_keys
+    if source_calib_overlap:
+        raise ValueError(f"Resolved source overlap with calib split: {sorted(source_calib_overlap)}")
+
+    all_keys = {
+        (str(row.competition_name), str(row.season_name))
+        for row in df_local[["competition_name", "season_name"]].drop_duplicates().itertuples(index=False)
+    }
+    claimed_test_keys = year_shift_keys | league_shift_keys | league_season_shift_keys
+    residual_target_keys = all_keys - source_keys - claimed_test_keys
+
+    return {
+        "source_keys": source_keys,
+        "calib_keys": calib_keys,
+        "target_keys": residual_target_keys,
+        "test_keys": {
+            "league_shift": league_shift_keys,
+            "year_shift": year_shift_keys,
+            "league_season_shift": league_season_shift_keys,
+        },
+        "source_competitions": sorted({comp for comp, _ in source_keys}),
+        "calib_competitions": sorted({comp for comp, _ in calib_keys}),
+        "test_competitions": sorted({comp for comp, _ in claimed_test_keys}),
+    }
+
+
+def load_xy_competition_season_split(
+    target_col: str,
+    data_file: str | Path,
+    key_candidates: Sequence[str],
+    split_config: Mapping[str, Any],
+    validation_frac: float = 0.2,
+    random_state: int = 42,
+) -> ResolvedCompetitionSeasonSplit:
+    """Load data using competition-season split rules and stratify source by season."""
+    if target_col not in {"scores", "concedes"}:
+        raise ValueError("target_col must be 'scores' or 'concedes'")
+
+    df = read_h5_table(data_file=data_file, key_candidates=key_candidates).copy()
+    resolved = resolve_competition_season_split_spec(df=df, split_config=split_config)
+    feature_cols = select_vaep_feature_cols(df.columns)
+
+    key_series = list(zip(df["competition_name"].astype(str), df["season_name"].astype(str)))
+
+    def _subset(keys: set[tuple[str, str]]) -> pd.DataFrame:
+        if not keys:
+            return df.iloc[0:0].copy()
+        mask = pd.Series(key_series, index=df.index).isin(keys)
+        return df.loc[mask].copy()
+
+    df_source = _subset(resolved["source_keys"])
+    df_calib = _subset(resolved["calib_keys"])
+    df_target = _subset(resolved["target_keys"])
+    df_test = {name: _subset(keys) for name, keys in resolved["test_keys"].items()}
+
+    if df_source.empty:
+        raise ValueError("Source split is empty after competition-season filtering")
+
+    source_matches = (
+        df_source[["game_id", "season_id"]]
+        .drop_duplicates(subset=["game_id"])
+        .reset_index(drop=True)
+    )
+    season_counts = source_matches["season_id"].value_counts()
+    if (season_counts < 2).any():
+        too_small = sorted(season_counts[season_counts < 2].index.tolist())
+        raise ValueError(f"Cannot stratify source split by season_id; too few games in seasons: {too_small}")
+
+    train_matches, val_matches = train_test_split(
+        source_matches,
+        test_size=validation_frac,
+        stratify=source_matches["season_id"],
+        random_state=random_state,
+    )
+    train_game_ids = set(train_matches["game_id"].tolist())
+    val_game_ids = set(val_matches["game_id"].tolist())
+
+    df_source_train = df_source[df_source["game_id"].isin(train_game_ids)].copy()
+    df_source_val = df_source[df_source["game_id"].isin(val_game_ids)].copy()
+    if df_source_train.empty:
+        raise ValueError("Source train split is empty after season-stratified game sampling")
+    if df_source_val.empty:
+        raise ValueError("Source validation split is empty after season-stratified game sampling")
+
+    return ResolvedCompetitionSeasonSplit(
+        source_train=_build_split_frame("source_train", df_source_train, target_col, feature_cols),
+        source_val=_build_split_frame("source_val", df_source_val, target_col, feature_cols),
+        calib=_build_split_frame("calib", df_calib, target_col, feature_cols),
+        target=_build_split_frame("target", df_target, target_col, feature_cols),
+        test={
+            name: _build_split_frame(f"test_{name}", frame, target_col, feature_cols)
+            for name, frame in df_test.items()
+        },
+        feature_cols=list(feature_cols),
+        split_config=dict(split_config),
     )
 
 

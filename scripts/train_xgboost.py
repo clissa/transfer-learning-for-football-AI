@@ -23,6 +23,7 @@ python -m scripts.train_xgboost
 from __future__ import annotations
 
 import argparse
+import copy
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -44,7 +45,7 @@ from football_ai.evaluation import (
 from football_ai.training import (
     build_xgb_eval_set,
     drop_none_params,
-    load_xy_source_calib_target_split,
+    load_xy_competition_season_split,
     resolve_xgb_eval_metrics,
     save_model,
 )
@@ -61,23 +62,35 @@ TARGET_COL = "scores"  # or "concedes"
 RESULTS_PATH = Path("results/train_xgboost_vaep")
 MODELS_PATH = Path("models")
 
-# Source: Data used for training (split into train/val by matches)
-SOURCE_COMPETITIONS = [
-    "Premier League",
-    "La Liga",
-]
-# Calib: Reserved for calibration (not used in current training)
-CALIB_COMPETITIONS = [
-    "Serie A",
-    "Ligue 1",
-]
-# Target: 0-shot evaluation competitions
-TARGET_COMPETITIONS = [
-    "Champions League",
-    "UEFA Europa League",
-]
+# Default competition-season split
+DEFAULT_SPLIT_CONFIG: dict[str, Any] = {
+    "source": {
+        "competitions": ["La Liga"],
+        "exclude_seasons": ["2019-20", "2020-21"],
+    },
+    "calib": {
+        "competitions": ["Champions League", "UEFA Europa League"],
+    },
+    "test": {
+        "competitions": [
+            "La Liga",
+            "Premier League",
+            "Serie A",
+            "1. Bundesliga",
+            "Ligue 1",
+            "Champions League",
+            "UEFA Europa League",
+        ],
+        "year_shift": {
+            "seasons": ["2019-20", "2020-21"],
+        },
+        "league_season_shift": {
+            "explicit": {},
+        },
+    },
+}
 
-# Fraction of source matches to use for validation (stratified by league)
+# Fraction of source matches to use for validation (stratified by season_id)
 VALIDATION_FRAC = 0.2
 RANDOM_STATE: int | None = None
 
@@ -189,6 +202,19 @@ XGB_FIT_CONFIG: dict[str, Any] = {
 # =========================
 
 
+def _normalize_key_candidates(raw_value: Any) -> list[str]:
+    if isinstance(raw_value, str):
+        return [raw_value]
+    return [str(item) for item in raw_value]
+
+
+def _log_resolved_split(logger_obj: logging.Logger, split_name: str, rows: int, games: int, coverage: pd.DataFrame) -> None:
+    competitions = sorted(coverage["competition_name"].astype(str).unique().tolist()) if not coverage.empty else []
+    logger_obj.info("%s: rows=%d games=%d competition-seasons=%d competitions=%s", split_name, rows, games, len(coverage), competitions)
+    if not coverage.empty:
+        logger_obj.info("%s coverage:\n%s", split_name, coverage.to_string(index=False))
+
+
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
@@ -224,14 +250,11 @@ def main() -> int:
         or cfg.get("data", {}).get("file")
         or str(DATA_FILE)
     )
-    key_candidates: list[str] = cfg.get("data", {}).get("key_candidates", DATA_KEY)
+    key_candidates = _normalize_key_candidates(cfg.get("data", {}).get("key_candidates", DATA_KEY))
     target_col: str = args.target_col or cfg.get("data", {}).get("target_col", TARGET_COL)
 
     # --- Resolve split settings ---
-    split_cfg = cfg.get("split", {})
-    source_competitions: list[str] = split_cfg.get("source_competitions", SOURCE_COMPETITIONS)
-    calib_competitions: list[str] = split_cfg.get("calib_competitions", CALIB_COMPETITIONS)
-    target_competitions: list[str] = split_cfg.get("target_competitions", TARGET_COMPETITIONS)
+    split_cfg = copy.deepcopy(cfg.get("split", DEFAULT_SPLIT_CONFIG))
     validation_frac: float = float(split_cfg.get("validation_frac", VALIDATION_FRAC))
 
     # --- Resolve model config ---
@@ -288,28 +311,23 @@ def main() -> int:
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     # ---- Run ----
-    (
-        X_train,
-        y_train,
-        X_val,
-        y_val,
-        X_calib,
-        y_calib,
-        X_target,
-        y_target,
-        source_competitions_used,
-        calib_competitions_used,
-        target_competitions_used,
-    ) = load_xy_source_calib_target_split(
+    resolved_split = load_xy_competition_season_split(
         target_col=target_col,
         data_file=data_file,
         key_candidates=key_candidates,
-        source_competitions=source_competitions,
-        calib_competitions=calib_competitions,
-        target_competitions=target_competitions,
+        split_config=split_cfg,
         validation_frac=validation_frac,
         random_state=random_state,
     )
+
+    X_train = resolved_split.source_train.X
+    y_train = resolved_split.source_train.y
+    X_val = resolved_split.source_val.X
+    y_val = resolved_split.source_val.y
+    X_calib = resolved_split.calib.X
+    y_calib = resolved_split.calib.y
+    X_target = resolved_split.target.X
+    y_target = resolved_split.target.y
 
     X_train = X_train.astype(np.float32)
     X_val = X_val.astype(np.float32)
@@ -360,13 +378,22 @@ def main() -> int:
     logger.info("Target: %s", target_col)
     logger.info("Objective: %s", effective_model_config.get("objective"))
     logger.info("Eval metric: %s", effective_model_config.get("eval_metric"))
-    logger.info("Source competitions (train+val): %d %s", len(source_competitions_used), source_competitions_used)
-    logger.info("Calib competitions (reserved): %d %s", len(calib_competitions_used), calib_competitions_used)
-    logger.info("Target competitions (0-shot): %d %s", len(target_competitions_used), target_competitions_used)
     logger.info("Validation fraction: %s", validation_frac)
     logger.info("Validation mode: %s", eval_set_name)
     logger.info("Train samples: %d | Validation samples: %d", len(X_train), len(X_val))
     logger.info("Calib samples: %d | Target samples: %d", len(X_calib), len(X_target))
+    for split_name, split_frame in resolved_split.named_splits().items():
+        _log_resolved_split(
+            logger,
+            split_name,
+            rows=len(split_frame.X),
+            games=split_frame.n_games,
+            coverage=split_frame.competition_seasons,
+        )
+        split_frame.competition_seasons.to_csv(
+            results_path / f"coverage_{split_name}_{run_id}.csv",
+            index=False,
+        )
 
     model.fit(X_train, y_train, **fit_kwargs)
 
@@ -379,13 +406,28 @@ def main() -> int:
     save_model(model, model_path)
     logger.info("Model saved to: %s", model_path)
     
-    X_target = X_target.reindex(columns=train_feature_cols, fill_value=0)
-
-    X_val_eval = X_val.reindex(columns=train_feature_cols, fill_value=0)
-
-    y_proba_train = get_positive_class_scores(model, X_train)
-    y_proba_val = get_positive_class_scores(model, X_val_eval)
-    y_proba_target = get_positive_class_scores(model, X_target)
+    evaluation_frames: list[tuple[str, str, pd.DataFrame, pd.Series]] = [
+        ("train", "in-sample", X_train.reindex(columns=train_feature_cols, fill_value=0), y_train),
+        ("validation", "in-sample", X_val.reindex(columns=train_feature_cols, fill_value=0), y_val),
+    ]
+    for test_name, split_frame in resolved_split.test.items():
+        evaluation_frames.append(
+            (
+                f"test_{test_name}",
+                test_name.replace("_", "-"),
+                split_frame.X.reindex(columns=train_feature_cols, fill_value=0),
+                split_frame.y.astype(np.uint8),
+            )
+        )
+    if not resolved_split.target.X.empty:
+        evaluation_frames.append(
+            (
+                "target",
+                "residual-target",
+                resolved_split.target.X.reindex(columns=train_feature_cols, fill_value=0),
+                resolved_split.target.y.astype(np.uint8),
+            )
+        )
 
     selected_threshold = pred_threshold
     threshold_sweep_df: pd.DataFrame | None = None
@@ -403,36 +445,22 @@ def main() -> int:
         )
         logger.info("Selected threshold from validation F1 sweep: %.4f", selected_threshold)
 
-    train_metrics = evaluate_binary_with_baselines(y_proba_train, y_train, threshold=selected_threshold)
-    val_metrics = evaluate_binary_with_baselines(y_proba_val, y_val, threshold=selected_threshold)
-    target_metrics = evaluate_binary_with_baselines(y_proba_target, y_target, threshold=selected_threshold)
+    results_rows: list[dict[str, Any]] = []
+    for split_name, description, X_eval, y_eval in evaluation_frames:
+        y_proba = get_positive_class_scores(model, X_eval)
+        metrics = evaluate_binary_with_baselines(y_proba, y_eval, threshold=selected_threshold)
+        print_metrics(f"{split_name.upper()} ({description})", metrics)
+        results_rows.append({
+            "split": split_name,
+            "description": description,
+            "league_season": split_name,
+            **metrics,
+        })
+        cm = confusion_matrix(y_eval, (y_proba >= selected_threshold).astype(int))
+        plot_confusion_matrix(cm, split_name, results_path / f"confusion_matrix_{split_name}_{target_col}_{run_id}.png")
 
-    print_metrics("TRAIN (in-sample)", train_metrics)
-    print_metrics("VALIDATION (in-sample)", val_metrics)
-    print_metrics("TARGET (0-shot)", target_metrics)
-
-    results_df = pd.DataFrame(
-        {
-            "split": ["train", "validation", "target"],
-            "description": ["in-sample", "in-sample", "0-shot"],
-            "league_season": [
-                "source_group",
-                "source_group",
-                "target_group",
-            ],
-            **{k: [train_metrics[k], val_metrics[k], target_metrics[k]] for k in train_metrics},
-        }
-    )
+    results_df = pd.DataFrame(results_rows)
     results_df.to_csv(results_path / f"metrics_xgboost_positive-focus_{target_col}_{run_id}.csv", index=False)
-
-    # Compute confusion matrices
-    train_cm = confusion_matrix(y_train, (y_proba_train >= selected_threshold).astype(int))
-    val_cm = confusion_matrix(y_val, (y_proba_val >= selected_threshold).astype(int))
-    target_cm = confusion_matrix(y_target, (y_proba_target >= selected_threshold).astype(int))
-
-    plot_confusion_matrix(train_cm, "train", results_path / f"confusion_matrix_train_{target_col}_{run_id}.png")
-    plot_confusion_matrix(val_cm, "validation", results_path / f"confusion_matrix_validation_{target_col}_{run_id}.png")
-    plot_confusion_matrix(target_cm, "target", results_path / f"confusion_matrix_target_{target_col}_{run_id}.png")
 
     config_df = pd.DataFrame(
         {
@@ -440,9 +468,10 @@ def main() -> int:
             "target": [target_col],
             "objective": [effective_model_config.get("objective")],
             "eval_metric": [str(effective_model_config.get("eval_metric"))],
-            "source_competitions": [str(source_competitions_used)],
-            "calib_competitions": [str(calib_competitions_used)],
-            "target_competitions": [str(target_competitions_used)],
+            "source_competitions": [str(resolved_split.source_train.competitions)],
+            "calib_competitions": [str(resolved_split.calib.competitions)],
+            "test_competitions": [str(sorted({comp for split in resolved_split.test.values() for comp in split.competitions}))],
+            "target_competitions": [str(resolved_split.target.competitions)],
             "validation_frac": [validation_frac],
             "data_file": [str(data_file)],
             "h5_key_candidates": [str(key_candidates)],
@@ -453,6 +482,7 @@ def main() -> int:
             "threshold_sweep_enabled": [enable_threshold_sweep],
             "threshold_grid": [f"{threshold_min}:{threshold_max}:{threshold_steps}"],
             "model_path": [str(model_path)],
+            "split_config": [str(split_cfg)],
             "xgb_model_config": [str(drop_none_params(effective_model_config))],
             "xgb_fit_config": [str(drop_none_params(effective_fit_config))],
         }

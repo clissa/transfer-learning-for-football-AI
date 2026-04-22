@@ -2,9 +2,11 @@
 # Usage: python -m scripts.train_xgboost --config configs/train_xgboost.yaml
 #
 # Data split strategy:
-# - Source: training competitions (split into train 80% / validation 20% by matches, stratified by league)
-# - Calib: calibration competitions (reserved for future use)
-# - Target: test competitions (0-shot evaluation)
+# - Source: La Liga except selected held-out seasons
+# - Source train/val: split by matches, stratified by season_id
+# - Test: inferred league_shift / year_shift / league_season_shift testbeds
+# - Target: residual competition-seasons not used by source or test
+# - Calib: auxiliary view that may overlap any non-source split
 
 data:
   file: "data/vaep_data/major_leagues_vaep.h5"
@@ -12,13 +14,31 @@ data:
   target_col: "scores"        # or "concedes"
 
 split:
-  # Source: competitions used for training (split into train 80% / validation 20% by matches, stratified by league)
-  source_competitions: ["Premier League", "La Liga", "1. Bundeliga"]
-  # Calib: reserved for calibration (not used in current training)
-  calib_competitions: ["Champions League", "UEFA Europa League"]
-  # Target: 0-shot evaluation competitions
-  target_competitions: ["Serie A", "Ligue 1"]
-  # Fraction of source matches to use for validation (stratified by league)
+  source:
+    competitions: ["La Liga"]
+    exclude_seasons: ["1973-74", "2019-20", "2020-21"]
+
+  calib:
+    competitions: ["Champions League", "UEFA Europa League"]
+
+  test:
+    competitions: [
+      "La Liga",
+      "Premier League",
+      "Serie A",
+      "1. Bundesliga",
+      "Ligue 1",
+      "Champions League",
+      "UEFA Europa League",
+    ]
+    year_shift:
+      seasons: ["2019-20", "2020-21"]
+    # Optional manual additions to league_season_shift.
+    # Leave empty to infer non-overlapping seasons automatically.
+    league_season_shift:
+      explicit: {}
+
+  # Fraction of source matches to use for validation (stratified by season_id)
   validation_frac: 0.2
 
 model:

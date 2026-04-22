@@ -30,7 +30,14 @@ from football_ai.data import (
     REQUIRED_STYLE_COLS,
 )
 from football_ai.evaluation import evaluate_binary, get_positive_class_scores
-from football_ai.training import build_sklearn_model, build_preprocessor, preprocess_split
+from football_ai.training import (
+    build_sklearn_model,
+    build_preprocessor,
+    load_xy_competition_season_split,
+    preprocess_split,
+    resolve_competition_season_split_spec,
+    resolve_season_aliases,
+)
 
 
 # ──────────────────────────────────────────────
@@ -254,3 +261,144 @@ def test_build_preprocessor_and_preprocess():
     X_preproc = preprocess_split(X, num, cat, scaler, encoder)
     assert X_preproc.shape[0] == n
     assert X_preproc.shape[1] == len(feature_names)
+
+
+@pytest.fixture
+def split_refactor_df():
+    rows: list[dict[str, object]] = []
+    competitions = {
+        ("La Liga", "2015/2016", 101): 6,
+        ("La Liga", "2016/2017", 102): 6,
+        ("La Liga", "2019/2020", 103): 6,
+        ("La Liga", "2020/2021", 104): 6,
+        ("Premier League", "2015/2016", 201): 4,
+        ("Premier League", "2003/2004", 202): 4,
+        ("Serie A", "2015/2016", 301): 4,
+        ("Serie A", "1986/1987", 302): 4,
+        ("1. Bundesliga", "2015/2016", 401): 4,
+        ("1. Bundesliga", "2023/2024", 402): 4,
+        ("Ligue 1", "2015/2016", 501): 4,
+        ("Ligue 1", "2021/2022", 502): 4,
+        ("Ligue 1", "2022/2023", 503): 4,
+        ("Champions League", "2015/2016", 601): 4,
+        ("Champions League", "2004/2005", 602): 4,
+        ("Champions League", "1999/2000", 603): 4,
+        ("UEFA Europa League", "1988/1989", 701): 4,
+        ("FA Women's Super League", "2015/2016", 801): 4,
+    }
+    game_id = 1000
+    for (competition_name, season_name, season_id), n_games in competitions.items():
+        for _ in range(n_games):
+            for action_id in range(3):
+                rows.append({
+                    "game_id": game_id,
+                    "action_id": action_id,
+                    "competition_name": competition_name,
+                    "season_name": season_name,
+                    "season_id": season_id,
+                    "scores": int((game_id + action_id) % 2 == 0),
+                    "concedes": int((game_id + action_id + 1) % 3 == 0),
+                    "start_x_a0": float(game_id % 100) + action_id,
+                    "start_y_a0": float(season_id % 100) + action_id,
+                    "end_x_a0": float(game_id % 50) + action_id,
+                    "end_y_a0": float(season_id % 50) + action_id,
+                    "goalscore_diff": float((action_id % 3) - 1),
+                })
+            game_id += 1
+    return pd.DataFrame(rows)
+
+
+@pytest.fixture
+def split_refactor_config():
+    return {
+        "source": {
+            "competitions": ["La Liga"],
+            "exclude_seasons": ["2019-20", "2020-21"],
+        },
+        "calib": {
+            "competitions": ["Champions League", "UEFA Europa League"],
+        },
+        "test": {
+            "competitions": [
+                "La Liga",
+                "Premier League",
+                "Serie A",
+                "1. Bundesliga",
+                "Ligue 1",
+                "Champions League",
+                "UEFA Europa League",
+            ],
+            "year_shift": {
+                "seasons": ["2019-20", "2020/2021"],
+            },
+            "league_season_shift": {
+                "explicit": {},
+            },
+        },
+    }
+
+
+def test_resolve_season_aliases_accepts_flexible_aliases():
+    available = ["2015/2016", "2019/2020", "2020/2021"]
+    assert resolve_season_aliases(available, ["2019-20", "2020/2021"]) == ["2019/2020", "2020/2021"]
+
+
+def test_resolve_season_aliases_rejects_unknown_alias():
+    with pytest.raises(ValueError, match="Could not resolve requested season"):
+        resolve_season_aliases(["2015/2016"], ["2099-00"])
+
+
+def test_resolve_competition_season_split_spec_infers_shift_groups(split_refactor_df, split_refactor_config):
+    resolved = resolve_competition_season_split_spec(split_refactor_df, split_refactor_config)
+
+    assert resolved["source_keys"] == {("La Liga", "2015/2016"), ("La Liga", "2016/2017")}
+    assert resolved["test_keys"]["year_shift"] == {("La Liga", "2019/2020"), ("La Liga", "2020/2021")}
+    assert resolved["test_keys"]["league_shift"] == {
+        ("Premier League", "2015/2016"),
+        ("Serie A", "2015/2016"),
+        ("1. Bundesliga", "2015/2016"),
+        ("Ligue 1", "2015/2016"),
+        ("Champions League", "2015/2016"),
+    }
+    assert resolved["test_keys"]["league_season_shift"] == {
+        ("Premier League", "2003/2004"),
+        ("Serie A", "1986/1987"),
+        ("1. Bundesliga", "2023/2024"),
+        ("Ligue 1", "2021/2022"),
+        ("Ligue 1", "2022/2023"),
+        ("Champions League", "2004/2005"),
+        ("Champions League", "1999/2000"),
+        ("UEFA Europa League", "1988/1989"),
+    }
+    assert ("Champions League", "2015/2016") in resolved["calib_keys"]
+    assert ("UEFA Europa League", "1988/1989") in resolved["calib_keys"]
+    assert resolved["target_keys"] == {("FA Women's Super League", "2015/2016")}
+
+
+def test_load_xy_competition_season_split_stratifies_source_by_season(monkeypatch, split_refactor_df, split_refactor_config):
+    monkeypatch.setattr("football_ai.training.read_h5_table", lambda data_file, key_candidates: split_refactor_df.copy())
+    resolved = load_xy_competition_season_split(
+        target_col="scores",
+        data_file="unused.h5",
+        key_candidates=["vaep_data"],
+        split_config=split_refactor_config,
+        validation_frac=0.5,
+        random_state=7,
+    )
+
+    train_games = set(resolved.source_train.df["game_id"].unique())
+    val_games = set(resolved.source_val.df["game_id"].unique())
+    assert train_games.isdisjoint(val_games)
+
+    train_counts = resolved.source_train.df[["game_id", "season_id"]].drop_duplicates()["season_id"].value_counts().to_dict()
+    val_counts = resolved.source_val.df[["game_id", "season_id"]].drop_duplicates()["season_id"].value_counts().to_dict()
+    assert train_counts == {101: 3, 102: 3}
+    assert val_counts == {101: 3, 102: 3}
+
+    assert ("Champions League", "2015/2016") in {
+        tuple(row) for row in resolved.calib.competition_seasons[["competition_name", "season_name"]].itertuples(index=False, name=None)
+    }
+    assert ("Champions League", "2015/2016") in {
+        tuple(row) for row in resolved.test["league_shift"].competition_seasons[["competition_name", "season_name"]].itertuples(index=False, name=None)
+    }
+    assert resolved.target.competitions == ["FA Women's Super League"]
