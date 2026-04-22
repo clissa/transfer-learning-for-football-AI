@@ -61,11 +61,11 @@ logger = logging.getLogger(__name__)
 # ──────────────────────────────────────────────
 # Module-level defaults
 # ──────────────────────────────────────────────
-DATA_FILE = Path("data/vaep_data/major_leagues_vaep.h5")
-DATA_KEY = "vaep_data"
+DATA_FILE = Path("data/feat_engineered_vaep_data/major_leagues_vaep.h5")
+DATA_KEY = ["feat_engineered_vaep_data", "vaep_data"]
 TARGET_COL = "scores"
 
-SOURCE_COMPETITIONS = ["Premier League", "La Liga", "1. Bunedliga"]
+SOURCE_COMPETITIONS = ["Premier League", "La Liga", "1. Bundesliga"]
 TARGET_COMPETITIONS = ["Champions League", "UEFA Europa League"]
 VALIDATION_FRAC = 0.2
 RANDOM_STATE: int | None = 20260307
@@ -92,6 +92,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output-dir", type=str, default=None, help="Results directory")
     p.add_argument("--device", type=str, default=None, help="cpu or cuda")
     return p.parse_args()
+
+
+def _normalize_key_candidates(raw_value: Any) -> list[str]:
+    if isinstance(raw_value, str):
+        return [raw_value]
+    return [str(item) for item in raw_value]
 
 
 # ──────────────────────────────────────────────
@@ -315,7 +321,9 @@ def main() -> int:
 
     data_file = Path(args.data_file if hasattr(args, "data_file") and args.data_file
                      else cfg.get("data", {}).get("file", str(DATA_FILE)))
-    key_candidates = cfg.get("data", {}).get("key_candidates", [DATA_KEY])
+    key_candidates = _normalize_key_candidates(
+        cfg.get("data", {}).get("key_candidates", DATA_KEY)
+    )
     target_col: str = args.target_col or cfg.get("data", {}).get("target_col", TARGET_COL)
 
     split_cfg = cfg.get("split", {})
@@ -360,7 +368,7 @@ def main() -> int:
         "scale_pos_weight": 80,
         "eval_metric": ["aucpr", "auc", "logloss"],
         "early_stopping_rounds": 50,
-        "enable_categorical": True,
+        "enable_categorical": False,
         "importance_type": "gain",
         "validate_parameters": True,
     }
@@ -432,9 +440,6 @@ def main() -> int:
         random_state=random_state,
     )
 
-    X_source_train = X_source_train.astype(np.float32)
-    X_source_val = X_source_val.astype(np.float32)
-    X_target = X_target.astype(np.float32)
     y_source_train = y_source_train.astype(np.uint8)
     y_source_val = y_source_val.astype(np.uint8)
     y_target = y_target.astype(np.uint8)

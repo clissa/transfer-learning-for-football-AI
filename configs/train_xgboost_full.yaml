@@ -7,15 +7,15 @@
 # - Target: test competitions (0-shot evaluation)
 
 data:
-  file: "data/vaep_data/all_leagues_vaep.h5"
-  key_candidates: ["vaep_data"]
+  file: "data/feat_engineered_vaep_data/all_leagues_vaep.h5"
+  key_candidates: ["feat_engineered_vaep_data", "vaep_data"]
   target_col: "scores"        # or "concedes"
 
 split:
   # Source: competitions used for training (split into train 80% / validation 20% by matches, stratified by league)
   source_competitions: [
-    "Premier League", "La Liga", "Copa del Rey", 
-    "1. Bundeliga", "Serie A", "Ligue 1", 
+    "Premier League", "La Liga", "Copa del Rey",
+    "1. Bundesliga", "Serie A", "Ligue 1",
     "Champions League", "UEFA Europa League", 
     ]
   # Calib: reserved for calibration (not used in current training)

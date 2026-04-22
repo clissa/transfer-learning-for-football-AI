@@ -24,8 +24,8 @@ from football_ai.training import prepare_vaep_xgb_features
 # ═══════════════════════════════════════════════
 # Configurable globals
 # ═══════════════════════════════════════════════
-DATA_FILE: str | Path = "data/vaep_data/major_leagues_vaep.h5"
-DATA_KEY: str = "vaep_data"
+DATA_FILE: str | Path = "data/feat_engineered_vaep_data/major_leagues_vaep.h5"
+DATA_KEY_CANDIDATES: list[str] = ["feat_engineered_vaep_data", "vaep_data"]
 MODEL_FILE: str | Path = "models/xgboost_scores_20260307.pkl"
 
 TARGET_COL: str = "scores"
@@ -51,8 +51,8 @@ def print_metrics(title: str, metrics: dict[str, float]) -> None:
 
 def main() -> None:
     # ── Load data ──────────────────────────────
-    print(f"Loading data from {DATA_FILE} (key={DATA_KEY!r}) ...")
-    df = read_h5_table(data_file=DATA_FILE, key_candidates=[DATA_KEY])
+    print(f"Loading data from {DATA_FILE} (keys={DATA_KEY_CANDIDATES!r}) ...")
+    df = read_h5_table(data_file=DATA_FILE, key_candidates=DATA_KEY_CANDIDATES)
 
     if "competition_name" not in df.columns:
         raise KeyError("Expected 'competition_name' column in dataset")

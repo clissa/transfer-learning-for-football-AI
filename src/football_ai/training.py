@@ -7,10 +7,10 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
@@ -78,21 +78,61 @@ class ResolvedCompetitionSeasonSplit:
 
     source_train: ResolvedSplitFrame
     source_val: ResolvedSplitFrame
-    calib: ResolvedSplitFrame
-    target: ResolvedSplitFrame
-    test: dict[str, ResolvedSplitFrame]
     feature_cols: list[str]
     split_config: dict[str, Any]
+    _lazy_split_loaders: dict[str, Callable[[], ResolvedSplitFrame]] = field(
+        default_factory=dict,
+        repr=False,
+    )
+    _materialized_splits: dict[str, ResolvedSplitFrame] = field(
+        default_factory=dict,
+        repr=False,
+    )
 
-    def named_splits(self) -> dict[str, ResolvedSplitFrame]:
+    def _get_lazy_split(self, name: str) -> ResolvedSplitFrame:
+        if name not in self._lazy_split_loaders:
+            raise KeyError(f"Unknown split {name!r}")
+        if name not in self._materialized_splits:
+            self._materialized_splits[name] = self._lazy_split_loaders[name]()
+        return self._materialized_splits[name]
+
+    @property
+    def calib(self) -> ResolvedSplitFrame:
+        return self._get_lazy_split("calib")
+
+    @property
+    def target(self) -> ResolvedSplitFrame:
+        return self._get_lazy_split("target")
+
+    @property
+    def test_names(self) -> list[str]:
+        return sorted(
+            name.removeprefix("test_")
+            for name in self._lazy_split_loaders
+            if name.startswith("test_")
+        )
+
+    def get_test_split(self, name: str) -> ResolvedSplitFrame:
+        return self._get_lazy_split(f"test_{name}")
+
+    def iter_test_splits(self) -> list[tuple[str, ResolvedSplitFrame]]:
+        return [(name, self.get_test_split(name)) for name in self.test_names]
+
+    def is_materialized(self, name: str) -> bool:
+        if name in {"source_train", "source_val"}:
+            return True
+        return name in self._materialized_splits
+
+    def named_splits(self, include_lazy: bool = False) -> dict[str, ResolvedSplitFrame]:
         splits = {
             "source_train": self.source_train,
             "source_val": self.source_val,
-            "calib": self.calib,
-            "target": self.target,
         }
-        for name, split in self.test.items():
-            splits[f"test_{name}"] = split
+        if include_lazy:
+            splits["calib"] = self.calib
+            splits["target"] = self.target
+            for name in self.test_names:
+                splits[f"test_{name}"] = self.get_test_split(name)
         return splits
 
 
@@ -184,6 +224,16 @@ _SCORES_CATEGORICAL_FEATURE_COLS: tuple[str, ...] = (
     "result_a0", "result_a1", "result_a2",
     "bodypart_a0", "bodypart_a1", "bodypart_a2",
 )
+_SCORES_BINARY_FEATURE_COLS: tuple[str, ...] = (
+    "in_final_third",
+    "start_in_box",
+    "end_in_box",
+    "same_team_a01",
+    "same_team_a12",
+    "same_team_a02",
+    "turnover_a01",
+    "turnover_a12",
+)
 _SCORES_DERIVED_FEATURE_COLS: tuple[str, ...] = (
     "start_dist_to_goal",
     "end_dist_to_goal",
@@ -199,6 +249,19 @@ _SCORES_DERIVED_FEATURE_COLS: tuple[str, ...] = (
     "turnover_a01",
     "turnover_a12",
     "possession_chain_len",
+)
+_SCORES_ENGINEERED_FEATURE_COLS: tuple[str, ...] = (
+    *_VAEP_BASE_NUMERIC_FEATURE_COLS,
+    *_SCORES_DERIVED_FEATURE_COLS,
+    *_SCORES_CATEGORICAL_FEATURE_COLS,
+)
+_SCORES_METADATA_COLS: tuple[str, ...] = (
+    "game_id",
+    "action_id",
+    "competition_name",
+    "season_name",
+    "season_id",
+    "team_id",
 )
 
 
@@ -291,6 +354,79 @@ def _in_box(x: pd.Series, y: pd.Series) -> pd.Series:
     )
 
 
+def normalize_xgb_feature_frame(
+    X: pd.DataFrame,
+    *,
+    binary_cols: Sequence[str] = (),
+    categorical_cols: Sequence[str] = (),
+    categorical_levels: Mapping[str, Sequence[str]] | None = None,
+) -> pd.DataFrame:
+    """Cast XGBoost feature columns to compact, deterministic dtypes."""
+    X_norm = X.copy()
+    binary_set = {col for col in binary_cols if col in X_norm.columns}
+    categorical_set = {col for col in categorical_cols if col in X_norm.columns}
+    numeric_cols = [
+        col for col in X_norm.columns if col not in binary_set and col not in categorical_set
+    ]
+
+    if numeric_cols:
+        numeric_frame = (
+            X_norm.loc[:, numeric_cols]
+            .apply(pd.to_numeric, errors="coerce")
+            .replace([np.inf, -np.inf], np.nan)
+        )
+        for col in numeric_cols:
+            X_norm[col] = numeric_frame[col].astype(np.float32)
+
+    for col in binary_set:
+        X_norm[col] = (
+            pd.to_numeric(X_norm[col], errors="coerce")
+            .replace([np.inf, -np.inf], np.nan)
+            .fillna(0)
+            .clip(lower=0, upper=1)
+            .astype(np.uint8)
+        )
+
+    for col in categorical_set:
+        if pd.api.types.is_numeric_dtype(X_norm[col]) and not pd.api.types.is_bool_dtype(X_norm[col]):
+            X_norm[col] = (
+                pd.to_numeric(X_norm[col], errors="coerce")
+                .fillna(-1)
+                .astype(np.int32)
+            )
+            continue
+
+        levels = None
+        if categorical_levels is not None and col in categorical_levels:
+            levels = list(dict.fromkeys(str(level) for level in categorical_levels[col]))
+            levels.append("__MISSING__")
+
+        normalized = X_norm[col].astype("string").fillna("__MISSING__")
+        if levels is None:
+            X_norm[col] = normalized.astype("category").cat.codes.astype(np.int32)
+        else:
+            X_norm[col] = pd.Categorical(normalized, categories=levels).codes.astype(np.int32)
+
+    return X_norm
+
+
+def normalize_xgb_labels(y: pd.Series) -> pd.Series:
+    """Cast binary labels to uint8."""
+    values = (
+        pd.to_numeric(y, errors="coerce")
+        .replace([np.inf, -np.inf], np.nan)
+        .fillna(0)
+        .clip(lower=0, upper=1)
+        .astype(np.uint8)
+    )
+    return pd.Series(values, index=y.index, name=y.name)
+
+
+def is_scores_engineered_dataset(df: pd.DataFrame) -> bool:
+    """Return True when df already contains the persisted scores feature schema."""
+    return set(_SCORES_ENGINEERED_FEATURE_COLS).issubset(df.columns)
+
+
 def build_scores_xgb_feature_frame(
     df: pd.DataFrame,
 ) -> tuple[pd.DataFrame, list[str], list[str]]:
@@ -310,6 +446,23 @@ def build_scores_xgb_feature_frame(
         original row index and includes mixed numeric / categorical dtypes.
     """
     total_start = perf_counter()
+    categorical_cols = list(_SCORES_CATEGORICAL_FEATURE_COLS)
+
+    if is_scores_engineered_dataset(df):
+        feature_cols = list(_SCORES_ENGINEERED_FEATURE_COLS)
+        X = normalize_xgb_feature_frame(
+            df.loc[:, feature_cols].copy(),
+            binary_cols=_SCORES_BINARY_FEATURE_COLS,
+            categorical_cols=categorical_cols,
+        )
+        logger.info(
+            "scores feature prep: reused persisted engineered schema rows=%d features=%d in %.2fs",
+            len(X),
+            len(feature_cols),
+            perf_counter() - total_start,
+        )
+        return X, feature_cols, categorical_cols
+
     required_cols = {
         "game_id",
         "action_id",
@@ -335,6 +488,7 @@ def build_scores_xgb_feature_frame(
         len(base_numeric_cols),
     )
     X = df.loc[:, base_numeric_cols].copy()
+    categorical_levels: dict[str, list[str]] = {}
 
     decode_start = perf_counter()
     for feature_name, family_prefix in (
@@ -346,6 +500,12 @@ def build_scores_xgb_feature_frame(
         for slot in ("a0", "a1", "a2"):
             output_col = f"{feature_name}_{slot}"
             slot_start = perf_counter()
+            matches = _extract_onehot_categories(
+                df.columns,
+                family_prefix=family_prefix,
+                slot=slot,
+            )
+            categorical_levels[output_col] = [label for _, label in matches]
             X[output_col] = _decode_onehot_slot_feature(
                 df=df,
                 family_prefix=family_prefix,
@@ -379,9 +539,9 @@ def build_scores_xgb_feature_frame(
     X["end_dist_to_goal"] = end_dist
     X["start_angle_to_goal"] = _angle_to_goal(start_x, start_y)
     X["end_angle_to_goal"] = _angle_to_goal(end_x, end_y)
-    X["in_final_third"] = (start_x >= (2.0 * float(FIELD_LENGTH) / 3.0)).astype(np.uint8)
-    X["start_in_box"] = _in_box(start_x, start_y).astype(np.uint8)
-    X["end_in_box"] = _in_box(end_x, end_y).astype(np.uint8)
+    X["in_final_third"] = start_x >= (2.0 * float(FIELD_LENGTH) / 3.0)
+    X["start_in_box"] = _in_box(start_x, start_y)
+    X["end_in_box"] = _in_box(end_x, end_y)
     X["dist_to_goal_delta"] = start_dist - end_dist
     logger.info(
         "scores feature prep: geometry features finished in %.2fs",
@@ -400,14 +560,14 @@ def build_scores_xgb_feature_frame(
     possession_start = team_id.ne(prev_team).fillna(True)
     possession_group = possession_start.groupby(history["game_id"]).cumsum()
 
-    history["same_team_a01"] = team_id.eq(prev_team).fillna(False).astype(np.uint8)
-    history["same_team_a12"] = prev_team.eq(prev_prev_team).fillna(False).astype(np.uint8)
-    history["same_team_a02"] = team_id.eq(prev_prev_team).fillna(False).astype(np.uint8)
-    history["turnover_a01"] = (prev_team.notna() & team_id.ne(prev_team)).astype(np.uint8)
-    history["turnover_a12"] = (prev_prev_team.notna() & prev_team.ne(prev_prev_team)).astype(np.uint8)
-    history["possession_chain_len"] = (
-        history.groupby(["game_id", possession_group]).cumcount() + 1
-    ).astype(np.int32)
+    history["same_team_a01"] = team_id.eq(prev_team).fillna(False)
+    history["same_team_a12"] = prev_team.eq(prev_prev_team).fillna(False)
+    history["same_team_a02"] = team_id.eq(prev_prev_team).fillna(False)
+    history["turnover_a01"] = prev_team.notna() & team_id.ne(prev_team)
+    history["turnover_a12"] = prev_prev_team.notna() & prev_team.ne(prev_prev_team)
+    history["possession_chain_len"] = history.groupby(
+        ["game_id", possession_group]
+    ).cumcount() + 1
 
     for col in (
         "same_team_a01",
@@ -423,15 +583,20 @@ def build_scores_xgb_feature_frame(
         perf_counter() - possession_start_time,
     )
 
-    feature_cols = base_numeric_cols + list(_SCORES_DERIVED_FEATURE_COLS) + list(_SCORES_CATEGORICAL_FEATURE_COLS)
-    X = X.loc[:, feature_cols]
+    feature_cols = list(_SCORES_ENGINEERED_FEATURE_COLS)
+    X = normalize_xgb_feature_frame(
+        X.loc[:, feature_cols],
+        binary_cols=_SCORES_BINARY_FEATURE_COLS,
+        categorical_cols=categorical_cols,
+        categorical_levels=categorical_levels,
+    )
     logger.info(
         "scores feature prep: complete rows=%d features=%d in %.2fs",
         len(X),
         len(feature_cols),
         perf_counter() - total_start,
     )
-    return X, feature_cols, list(_SCORES_CATEGORICAL_FEATURE_COLS)
+    return X, feature_cols, categorical_cols
 
 
 def prepare_vaep_xgb_features(
@@ -448,25 +613,35 @@ def prepare_vaep_xgb_features(
         ``(X, feature_cols, categorical_cols)``.
     """
     if target_col == "scores":
-        X, feature_cols, categorical_cols = build_scores_xgb_feature_frame(df)
+        return build_scores_xgb_feature_frame(df)
     else:
         feature_cols = select_vaep_feature_cols(df.columns)
         categorical_cols = []
-        X = df.loc[:, feature_cols].copy()
-
-    numeric_cols = [col for col in feature_cols if col not in categorical_cols]
-    if numeric_cols:
-        numeric_frame = (
-            X.loc[:, numeric_cols]
-            .apply(pd.to_numeric, errors="coerce")
-            .replace([np.inf, -np.inf], np.nan)
-            .fillna(0)
+        X = normalize_xgb_feature_frame(
+            df.loc[:, feature_cols].copy(),
+            binary_cols=[col for col in _VAEP_ONEHOT_FEATURE_COLS if col in feature_cols],
         )
-        for col in numeric_cols:
-            X[col] = numeric_frame[col]
-    for col in categorical_cols:
-        X[col] = X[col].astype("category")
-    return X, feature_cols, categorical_cols
+        return X, feature_cols, categorical_cols
+
+
+def build_scores_engineered_dataset(
+    df: pd.DataFrame,
+    metadata_cols: Sequence[str] | None = None,
+) -> tuple[pd.DataFrame, list[str], list[str]]:
+    """Build the persisted engineered dataset for the scores XGBoost workflow."""
+    X, feature_cols, categorical_cols = build_scores_xgb_feature_frame(df)
+    selected_metadata_cols = [
+        col for col in (metadata_cols or _SCORES_METADATA_COLS) if col in df.columns
+    ]
+    engineered = df.loc[:, selected_metadata_cols].copy()
+    for col in ("competition_name", "season_name"):
+        if col in engineered.columns:
+            engineered[col] = engineered[col].astype(str)
+    for label_col in ("scores", "concedes"):
+        if label_col in df.columns:
+            engineered[label_col] = normalize_xgb_labels(df[label_col])
+    engineered = pd.concat([engineered, X], axis=1)
+    return engineered, feature_cols, categorical_cols
 
 
 # ──────────────────────────────────────────────
@@ -1121,7 +1296,11 @@ def _build_split_frame(
     if X is None:
         X, _, _ = prepare_vaep_xgb_features(frame, target_col=target_col)
     X = X.loc[:, list(feature_cols)].copy()
-    y = frame[target_col].astype(int) if target_col in frame.columns else pd.Series(dtype=int)
+    y = (
+        normalize_xgb_labels(frame[target_col])
+        if target_col in frame.columns
+        else pd.Series(dtype=np.uint8)
+    )
     coverage = _build_competition_season_coverage(frame)
     return ResolvedSplitFrame(name=name, df=frame.copy(), X=X, y=y, competition_seasons=coverage)
 
@@ -1282,15 +1461,6 @@ def load_xy_competition_season_split(
         perf_counter() - load_start,
     )
 
-    prep_start = perf_counter()
-    X_all, feature_cols, _ = prepare_vaep_xgb_features(df, target_col=target_col)
-    logger.info(
-        "load_xy_competition_season_split: prepared X rows=%d features=%d in %.2fs",
-        len(X_all),
-        len(feature_cols),
-        perf_counter() - prep_start,
-    )
-
     resolve_start = perf_counter()
     resolved = resolve_competition_season_split_spec(df=df, split_config=split_config)
     logger.info(
@@ -1298,27 +1468,26 @@ def load_xy_competition_season_split(
         perf_counter() - resolve_start,
     )
 
-    key_series = list(zip(df["competition_name"].astype(str), df["season_name"].astype(str)))
+    key_membership = pd.Series(
+        list(zip(df["competition_name"].astype(str), df["season_name"].astype(str))),
+        index=df.index,
+    )
 
-    def _subset(keys: set[tuple[str, str]]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    def _subset_frame(keys: set[tuple[str, str]]) -> pd.DataFrame:
         if not keys:
             empty_mask = pd.Series(False, index=df.index)
-            return df.loc[empty_mask].copy(), X_all.loc[empty_mask].copy()
-        mask = pd.Series(key_series, index=df.index).isin(keys)
-        return df.loc[mask].copy(), X_all.loc[mask].copy()
+            return df.loc[empty_mask].copy()
+        mask = key_membership.isin(keys)
+        return df.loc[mask].copy()
 
     subset_start = perf_counter()
-    df_source, X_source = _subset(resolved["source_keys"])
-    df_calib, X_calib = _subset(resolved["calib_keys"])
-    df_target, X_target = _subset(resolved["target_keys"])
-    df_test = {name: _subset(keys) for name, keys in resolved["test_keys"].items()}
+    df_source = _subset_frame(resolved["source_keys"])
     logger.info(
-        "load_xy_competition_season_split: materialized split subsets in %.2fs "
-        "(source=%d calib=%d target=%d)",
+        "load_xy_competition_season_split: isolated source membership in %.2fs "
+        "(source_rows=%d source_games=%d)",
         perf_counter() - subset_start,
         len(df_source),
-        len(df_calib),
-        len(df_target),
+        df_source["game_id"].nunique() if not df_source.empty else 0,
     )
 
     if df_source.empty:
@@ -1346,8 +1515,6 @@ def load_xy_competition_season_split(
 
     df_source_train = df_source[df_source["game_id"].isin(train_game_ids)].copy()
     df_source_val = df_source[df_source["game_id"].isin(val_game_ids)].copy()
-    X_source_train = X_source.loc[df_source_train.index].copy()
-    X_source_val = X_source.loc[df_source_val.index].copy()
     if df_source_train.empty:
         raise ValueError("Source train split is empty after season-stratified game sampling")
     if df_source_val.empty:
@@ -1363,27 +1530,52 @@ def load_xy_competition_season_split(
     )
 
     frame_start = perf_counter()
+    X_source_train, feature_cols, _ = prepare_vaep_xgb_features(
+        df_source_train,
+        target_col=target_col,
+    )
     result = ResolvedCompetitionSeasonSplit(
-        source_train=_build_split_frame("source_train", df_source_train, target_col, feature_cols, X=X_source_train),
-        source_val=_build_split_frame("source_val", df_source_val, target_col, feature_cols, X=X_source_val),
-        calib=_build_split_frame("calib", df_calib, target_col, feature_cols, X=X_calib),
-        target=_build_split_frame("target", df_target, target_col, feature_cols, X=X_target),
-        test={
-            name: _build_split_frame(
-                f"test_{name}",
-                frame,
-                target_col,
-                feature_cols,
-                X=X_frame,
-            )
-            for name, (frame, X_frame) in df_test.items()
-        },
+        source_train=_build_split_frame(
+            "source_train",
+            df_source_train,
+            target_col,
+            feature_cols,
+            X=X_source_train,
+        ),
+        source_val=_build_split_frame("source_val", df_source_val, target_col, feature_cols),
         feature_cols=list(feature_cols),
         split_config=dict(split_config),
+        _lazy_split_loaders={
+            "calib": lambda: _build_split_frame(
+                "calib",
+                _subset_frame(resolved["calib_keys"]),
+                target_col,
+                feature_cols,
+            ),
+            "target": lambda: _build_split_frame(
+                "target",
+                _subset_frame(resolved["target_keys"]),
+                target_col,
+                feature_cols,
+            ),
+            **{
+                f"test_{name}": (
+                    lambda split_name=name, split_keys=keys: _build_split_frame(
+                        f"test_{split_name}",
+                        _subset_frame(split_keys),
+                        target_col,
+                        feature_cols,
+                    )
+                )
+                for name, keys in resolved["test_keys"].items()
+            },
+        },
     )
     logger.info(
-        "load_xy_competition_season_split: built resolved frames in %.2fs; total %.2fs",
+        "load_xy_competition_season_split: materialized source frames in %.2fs; "
+        "registered %d lazy non-source splits; total %.2fs",
         perf_counter() - frame_start,
+        len(result._lazy_split_loaders),
         perf_counter() - total_start,
     )
 
@@ -1486,13 +1678,13 @@ def load_xy_source_calib_target_split(
     if df_val.empty:
         raise ValueError("Validation split is empty after match sampling")
     X_train = X_all.loc[df_train.index, feature_cols].copy()
-    y_train = df_train[target_col].astype(int)
+    y_train = normalize_xgb_labels(df_train[target_col])
     X_val = X_all.loc[df_val.index, feature_cols].copy()
-    y_val = df_val[target_col].astype(int)
+    y_val = normalize_xgb_labels(df_val[target_col])
     X_calib = X_all.loc[df_calib.index, feature_cols].copy()
-    y_calib = df_calib[target_col].astype(int)
+    y_calib = normalize_xgb_labels(df_calib[target_col])
     X_target = X_all.loc[df_target.index, feature_cols].copy()
-    y_target = df_target[target_col].astype(int)
+    y_target = normalize_xgb_labels(df_target[target_col])
 
     return (
         X_train, y_train,
@@ -1587,7 +1779,7 @@ def load_fewshot_splits(
 
     def _xy(frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
         X = X_all.loc[frame.index, feature_cols].copy()
-        y = frame[target_col].astype(int)
+        y = normalize_xgb_labels(frame[target_col])
         return X, y
 
     X_train, y_train = _xy(df_train)

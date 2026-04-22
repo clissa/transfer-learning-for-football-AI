@@ -45,7 +45,11 @@ from football_ai.evaluation import (
     get_positive_class_scores,
     sweep_thresholds_for_f1,
 )
-from football_ai.training import drop_none_params
+from football_ai.training import (
+    drop_none_params,
+    normalize_xgb_feature_frame,
+    normalize_xgb_labels,
+)
 
 try:
     import optuna
@@ -260,17 +264,12 @@ def _prepare_features(
     feature_cols = num_feats + bool_feats + derived_bool_feats + cat_feats
     X = work[feature_cols].copy()
 
-    for c in num_feats:
-        X[c] = pd.to_numeric(X[c], errors="coerce").replace([np.inf, -np.inf], np.nan).astype(np.float32)
-    for c in bool_feats + derived_bool_feats:
-        X[c] = X[c].fillna(0).astype(np.uint8)
-    # Encode categorical variables as integer codes for compatibility with
-    # XGBoost builds that don't reliably propagate enable_categorical.
-    for c in cat_feats:
-        cat = X[c].astype("string").fillna("__MISSING__").astype("category")
-        X[c] = cat.cat.codes.astype(np.int32)
-
-    y = work[target_col].astype(np.uint8)
+    X = normalize_xgb_feature_frame(
+        X,
+        binary_cols=bool_feats + derived_bool_feats,
+        categorical_cols=cat_feats,
+    )
+    y = normalize_xgb_labels(work[target_col])
 
     keep_for_training_or_targets = set(feature_cols) | {"scores", "concedes"}
     dropped_info_cols = [c for c in work.columns if c not in keep_for_training_or_targets]

@@ -4,13 +4,14 @@
 # Data split strategy:
 # - Source: La Liga except selected held-out seasons
 # - Source train/val: split by matches, stratified by season_id
+# - Model selection: in-domain source validation only
 # - Test: inferred league_shift / year_shift / league_season_shift testbeds
 # - Target: residual competition-seasons not used by source or test
 # - Calib: auxiliary view that may overlap any non-source split
 
 data:
-  file: "data/vaep_data/major_leagues_vaep.h5"
-  key_candidates: ["vaep_data"]
+  file: "data/feat_engineered_vaep_data/major_leagues_vaep.h5"
+  key_candidates: ["feat_engineered_vaep_data", "vaep_data"]
   target_col: "scores"        # or "concedes"
 
 split:

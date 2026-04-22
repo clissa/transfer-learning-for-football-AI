@@ -1,0 +1,13 @@
+# Configuration for scripts/create_feat_engineered_vaep.py
+# Usage: python -m scripts.create_feat_engineered_vaep --config configs/create_feat_engineered_vaep.yaml
+
+input_file: "data/vaep_data/all_leagues_vaep.h5"
+# input_file: "data/vaep_data/major_leagues_vaep.h5"
+# input_file: "data/vaep_data/women_leagues_vaep.h5"
+input_key: "vaep_data"
+
+output_dir: "data/feat_engineered_vaep_data"
+outname: "all_leagues_vaep.h5"
+# outname: "major_leagues_vaep.h5"
+# outname: "women_leagues_vaep.h5"
+output_key: "feat_engineered_vaep_data"

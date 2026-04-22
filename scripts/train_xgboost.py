@@ -5,9 +5,9 @@ CLI wrapper that reads config from module-level constants (or a YAML file)
 and calls into the library.
 
 Data split strategy:
-- Source: Training data (split into train 80% / validation 20% by matches, stratified by league)
-- Calib: Calibration data (reserved for future use)
-- Target: Test data (0-shot evaluation)
+- Source: La Liga source data (split into train 80% / validation 20% by matches, stratified by season)
+- Model selection: source validation only
+- Calib / test / target: reporting-only splits, materialized after fit
 
 Usage examples
 --------------
@@ -55,14 +55,15 @@ logger = logging.getLogger(__name__)
 # =========================
 # Global config
 # =========================
-DATA_FILE = Path("data/vaep_data/major_leagues_vaep.h5")
-DATA_KEY = "vaep_data"
+DATA_FILE = Path("data/feat_engineered_vaep_data/major_leagues_vaep.h5")
+DATA_KEY = ["feat_engineered_vaep_data", "vaep_data"]
 TARGET_COL = "scores"  # or "concedes"
 
 RESULTS_PATH = Path("results/train_xgboost_vaep")
 MODELS_PATH = Path("models")
 
-# Default competition-season split
+# Default competition-season split. The current objective is explicit:
+# source is La Liga, and model selection optimizes in-domain source validation.
 DEFAULT_SPLIT_CONFIG: dict[str, Any] = {
     "source": {
         "competitions": ["La Liga"],
@@ -107,7 +108,7 @@ OBJECTIVE = "binary:logistic"
 EVAL_METRIC: str | list[str] = ["aucpr", "auc", "logloss"]
 
 # Which validation set to pass into fit(eval_set=...):
-# - "train_val_split" -> use predefined validation competitions
+# - "train_val_split" -> use the in-domain held-out La Liga validation split
 # - "none" -> do not pass eval_set to fit
 VALIDATION_SET_MODE = "train_val_split"
 
@@ -171,7 +172,9 @@ XGB_MODEL_CONFIG: dict[str, Any] = {
     "interaction_constraints": None,
 
     # Categorical handling
-    "enable_categorical": True,
+    # Compact categorical features are deterministically encoded to int32 in
+    # shared preprocessing, so native categorical mode stays off by default.
+    "enable_categorical": False,
     "feature_types": None,
     "max_cat_to_onehot": None,
     "max_cat_threshold": None,
@@ -324,15 +327,8 @@ def main() -> int:
     y_train = resolved_split.source_train.y
     X_val = resolved_split.source_val.X
     y_val = resolved_split.source_val.y
-    X_calib = resolved_split.calib.X
-    y_calib = resolved_split.calib.y
-    X_target = resolved_split.target.X
-    y_target = resolved_split.target.y
-
     y_train = y_train.astype(np.uint8)
     y_val = y_val.astype(np.uint8)
-    y_calib = y_calib.astype(np.uint8)
-    y_target = y_target.astype(np.uint8)
 
     train_feature_cols = list(X_train.columns)
 
@@ -374,10 +370,10 @@ def main() -> int:
     logger.info("Target: %s", target_col)
     logger.info("Objective: %s", effective_model_config.get("objective"))
     logger.info("Eval metric: %s", effective_model_config.get("eval_metric"))
+    logger.info("Selection objective: in-domain source validation only")
     logger.info("Validation fraction: %s", validation_frac)
     logger.info("Validation mode: %s", eval_set_name)
     logger.info("Train samples: %d | Validation samples: %d", len(X_train), len(X_val))
-    logger.info("Calib samples: %d | Target samples: %d", len(X_calib), len(X_target))
     for split_name, split_frame in resolved_split.named_splits().items():
         _log_resolved_split(
             logger,
@@ -392,6 +388,10 @@ def main() -> int:
         )
 
     model.fit(X_train, y_train, **fit_kwargs)
+    y_proba_val = get_positive_class_scores(
+        model,
+        X_val.reindex(columns=train_feature_cols),
+    )
 
     # Save trained model — filename encodes run_id, seed, and best ES metric value
     es_metric_name = early_stopping_metric or "best"
@@ -406,7 +406,7 @@ def main() -> int:
         ("train", "in-sample", X_train.reindex(columns=train_feature_cols), y_train),
         ("validation", "in-sample", X_val.reindex(columns=train_feature_cols), y_val),
     ]
-    for test_name, split_frame in resolved_split.test.items():
+    for test_name, split_frame in resolved_split.iter_test_splits():
         evaluation_frames.append(
             (
                 f"test_{test_name}",
@@ -415,14 +415,30 @@ def main() -> int:
                 split_frame.y.astype(np.uint8),
             )
         )
-    if not resolved_split.target.X.empty:
+    target_split = resolved_split.target
+    if not target_split.X.empty:
         evaluation_frames.append(
             (
                 "target",
                 "residual-target",
-                resolved_split.target.X.reindex(columns=train_feature_cols),
-                resolved_split.target.y.astype(np.uint8),
+                target_split.X.reindex(columns=train_feature_cols),
+                target_split.y.astype(np.uint8),
             )
+        )
+
+    for split_name, split_frame in resolved_split.named_splits(include_lazy=True).items():
+        if split_name in {"source_train", "source_val"}:
+            continue
+        _log_resolved_split(
+            logger,
+            split_name,
+            rows=len(split_frame.X),
+            games=split_frame.n_games,
+            coverage=split_frame.competition_seasons,
+        )
+        split_frame.competition_seasons.to_csv(
+            results_path / f"coverage_{split_name}_{run_id}.csv",
+            index=False,
         )
 
     selected_threshold = pred_threshold
@@ -464,10 +480,11 @@ def main() -> int:
             "target": [target_col],
             "objective": [effective_model_config.get("objective")],
             "eval_metric": [str(effective_model_config.get("eval_metric"))],
+            "selection_objective": ["in_domain_source_validation_only"],
             "source_competitions": [str(resolved_split.source_train.competitions)],
             "calib_competitions": [str(resolved_split.calib.competitions)],
-            "test_competitions": [str(sorted({comp for split in resolved_split.test.values() for comp in split.competitions}))],
-            "target_competitions": [str(resolved_split.target.competitions)],
+            "test_competitions": [str(sorted({comp for _, split in resolved_split.iter_test_splits() for comp in split.competitions}))],
+            "target_competitions": [str(target_split.competitions)],
             "validation_frac": [validation_frac],
             "data_file": [str(data_file)],
             "h5_key_candidates": [str(key_candidates)],

@@ -28,13 +28,18 @@ from football_ai.data import (
     RESULT_MAP,
     BODYPART_MAP,
     REQUIRED_STYLE_COLS,
+    read_h5_table,
 )
 from football_ai.evaluation import evaluate_binary, get_positive_class_scores
+from football_ai.features import save_vaep_dataset as save_vaep_features_dataset
 from football_ai.training import (
+    build_scores_engineered_dataset,
     build_scores_xgb_feature_frame,
-    build_sklearn_model,
     build_preprocessor,
+    build_sklearn_model,
     load_xy_competition_season_split,
+    normalize_xgb_feature_frame,
+    normalize_xgb_labels,
     prepare_vaep_xgb_features,
     preprocess_split,
     resolve_competition_season_split_spec,
@@ -364,14 +369,18 @@ def test_build_scores_xgb_feature_frame_decodes_categories_and_possession(scores
         "result_a0", "result_a1", "result_a2",
         "bodypart_a0", "bodypart_a1", "bodypart_a2",
     ]
-    assert str(X["actiontype_a0"].dtype) == "category"
-    assert str(X["result_a1"].dtype) == "category"
-    assert str(X["bodypart_a2"].dtype) == "category"
-    assert X.loc[0, "actiontype_a0"] == "pass"
-    assert pd.isna(X.loc[0, "actiontype_a1"])
-    assert X.loc[2, "actiontype_a2"] == "pass"
-    assert X.loc[2, "result_a0"] == "fail"
-    assert X.loc[2, "bodypart_a0"] == "head"
+    assert X["actiontype_a0"].dtype == np.int32
+    assert X["result_a1"].dtype == np.int32
+    assert X["bodypart_a2"].dtype == np.int32
+    assert X["start_dist_to_goal"].dtype == np.float32
+    assert X["same_team_a01"].dtype == np.uint8
+    assert X["possession_chain_len"].dtype == np.float32
+    assert X.loc[0, "actiontype_a0"] == X.loc[1, "actiontype_a0"]
+    assert X.loc[0, "actiontype_a0"] != X.loc[2, "actiontype_a0"]
+    assert X.loc[0, "actiontype_a1"] == X.loc[0, "actiontype_a2"]
+    assert X.loc[2, "actiontype_a2"] == X.loc[0, "actiontype_a0"]
+    assert X.loc[2, "result_a0"] != X.loc[0, "result_a0"]
+    assert X.loc[2, "bodypart_a0"] != X.loc[0, "bodypart_a0"]
 
     assert np.isclose(
         X.loc[0, "start_dist_to_goal"] - X.loc[0, "end_dist_to_goal"],
@@ -405,7 +414,66 @@ def test_prepare_vaep_xgb_features_preserves_scores_categoricals(scores_feature_
     assert "actiontype_a0" in X.columns
     assert "same_team_a01" in X.columns
     assert "possession_chain_len" in X.columns
-    assert str(X["actiontype_a0"].dtype) == "category"
+    assert X["actiontype_a0"].dtype == np.int32
+
+
+def test_normalize_xgb_feature_frame_casts_low_precision_types():
+    X = pd.DataFrame(
+        {
+            "numeric": [1.0, np.inf, None],
+            "binary": [True, False, None],
+            "categorical": ["pass", "shot", None],
+        }
+    )
+    X_norm = normalize_xgb_feature_frame(
+        X,
+        binary_cols=["binary"],
+        categorical_cols=["categorical"],
+        categorical_levels={"categorical": ["pass", "shot"]},
+    )
+    y_norm = normalize_xgb_labels(pd.Series([1, 0, None], name="scores"))
+
+    assert X_norm["numeric"].dtype == np.float32
+    assert np.isnan(X_norm.loc[1, "numeric"])
+    assert X_norm["binary"].dtype == np.uint8
+    assert X_norm["binary"].tolist() == [1, 0, 0]
+    assert X_norm["categorical"].dtype == np.int32
+    assert X_norm.loc[0, "categorical"] != X_norm.loc[1, "categorical"]
+    assert y_norm.dtype == np.uint8
+    assert y_norm.tolist() == [1, 0, 0]
+
+
+def test_build_scores_engineered_dataset_roundtrips_to_hdf(
+    scores_feature_refactor_df,
+    tmp_path,
+):
+    engineered_df, feature_cols, categorical_cols = build_scores_engineered_dataset(
+        scores_feature_refactor_df
+    )
+    output_path = tmp_path / "scores_engineered.h5"
+    save_vaep_features_dataset(
+        engineered_df,
+        output_path,
+        key="feat_engineered_vaep_data",
+    )
+
+    loaded = read_h5_table(output_path, ["feat_engineered_vaep_data"])
+    X_loaded, loaded_feature_cols, loaded_categorical_cols = prepare_vaep_xgb_features(
+        loaded,
+        target_col="scores",
+    )
+    X_expected, expected_feature_cols, expected_categorical_cols = prepare_vaep_xgb_features(
+        scores_feature_refactor_df,
+        target_col="scores",
+    )
+
+    assert feature_cols == loaded_feature_cols == expected_feature_cols
+    assert categorical_cols == loaded_categorical_cols == expected_categorical_cols
+    assert "actiontype_pass_a0" not in loaded.columns
+    assert "actiontype_a0" in loaded.columns
+    assert loaded["scores"].dtype == np.uint8
+    assert loaded["concedes"].dtype == np.uint8
+    pd.testing.assert_frame_equal(X_loaded, X_expected)
 
 
 @pytest.fixture
@@ -592,11 +660,19 @@ def test_load_xy_competition_season_split_stratifies_source_by_season(monkeypatc
     val_counts = resolved.source_val.df[["game_id", "season_id"]].drop_duplicates()["season_id"].value_counts().to_dict()
     assert train_counts == {101: 3, 102: 3}
     assert val_counts == {101: 3, 102: 3}
+    assert resolved.test_names == ["league_season_shift", "league_shift", "year_shift"]
+    assert not resolved.is_materialized("calib")
+    assert not resolved.is_materialized("target")
+    assert not resolved.is_materialized("test_league_shift")
 
+    calib = resolved.calib
+    assert resolved.is_materialized("calib")
     assert ("Champions League", "2015/2016") in {
-        tuple(row) for row in resolved.calib.competition_seasons[["competition_name", "season_name"]].itertuples(index=False, name=None)
+        tuple(row) for row in calib.competition_seasons[["competition_name", "season_name"]].itertuples(index=False, name=None)
     }
+    league_shift = resolved.get_test_split("league_shift")
+    assert resolved.is_materialized("test_league_shift")
     assert ("Champions League", "2015/2016") in {
-        tuple(row) for row in resolved.test["league_shift"].competition_seasons[["competition_name", "season_name"]].itertuples(index=False, name=None)
+        tuple(row) for row in league_shift.competition_seasons[["competition_name", "season_name"]].itertuples(index=False, name=None)
     }
     assert resolved.target.competitions == ["FA Women's Super League"]
