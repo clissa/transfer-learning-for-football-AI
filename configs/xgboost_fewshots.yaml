@@ -13,7 +13,7 @@ data:
   target_col: "scores"        # or "concedes"
 
 split:
-  source_competitions: ["Premier League", "La Liga", "1. Bundeliga"]
+  source_competitions: ["Premier League", "La Liga", "1. Bundesliga"]
   target_competitions: ["Serie A", "Ligue 1", "Champions League", "UEFA Europa League"]
   validation_frac: 0.2        # source train/val split fraction
   random_state: 20260307

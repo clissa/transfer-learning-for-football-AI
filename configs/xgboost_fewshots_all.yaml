@@ -15,7 +15,7 @@ data:
 split:
   source_competitions: [
     "Premier League", "La Liga", "Copa del Rey", 
-    "1. Bundeliga", "Serie A", "Ligue 1", 
+    "1. Bundesliga", "Serie A", "Ligue 1", 
     "Champions League", "UEFA Europa League", 
     ]
   target_competitions: [
@@ -30,8 +30,8 @@ split:
 
 # Few-shot experiment settings
 fewshot:
-  budgets: [0.05, 0.15, 0.30, 0.50]           # fraction of target games sampled
-  seeds: [19920402, 19901229, 19921020, 20250726, 20100522]                # repeat each budget with different seeds
+  budgets: [0.05, 0.2, 0.4]           # fraction of target games sampled
+  seeds: [20140916] #19920402, 19901229, 19921020, 20250726, 20100522]                # repeat each budget with different seeds
   source_model_path: "models/xgboost_scores_20260309_094743_seed761136_auc=0.8099.pkl"
 
 # Source model config (used for target-only from-scratch training)
@@ -71,7 +71,7 @@ model:
 
 # Fine-tuning overrides (warm-start from source model)
 finetune:
-  n_estimators: 1000            # fewer additional boosting rounds
+  n_estimators: 500            # fewer additional boosting rounds
   learning_rate: 0.02          # reduced LR for gentle adaptation
   verbosity: 1
   n_jobs: 16
