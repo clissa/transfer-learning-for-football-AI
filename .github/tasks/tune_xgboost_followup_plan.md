@@ -68,7 +68,6 @@ After the study finishes, run the best model once on:
 
 - `source_train`
 - `source_val`
-- `calib`
 - each `test_*` split
 - `target`
 
