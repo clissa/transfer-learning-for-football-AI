@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 import scripts.tune_xgboost as tune_script
+from football_ai.config import load_config
 from football_ai.training import ResolvedSplitFrame
 from football_ai import tuning
 
@@ -303,6 +304,14 @@ def test_tune_script_delegates_to_library_with_yaml_and_cli_overrides(monkeypatc
         "seed": 456,
         "device": "cpu",
     }
+
+
+def test_default_tune_config_uses_cpu_device():
+    cfg = load_config(tuning.DEFAULT_CONFIG_PATH)
+    resolved = tuning.resolve_xgboost_tuning_config(cfg)
+
+    assert resolved["device"] == "cpu"
+    assert resolved["model"]["base_params"]["device"] == "cpu"
 
 
 def test_sample_search_space_uses_requested_n_estimators_range():

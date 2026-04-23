@@ -8,7 +8,7 @@ data:
 
 selected_metric: "roc_auc"
 seed: null
-device: "cuda"
+device: "cpu"
 
 split:
   validation_frac: 0.2
