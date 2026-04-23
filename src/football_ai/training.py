@@ -1499,17 +1499,40 @@ def load_xy_competition_season_split(
         .drop_duplicates(subset=["game_id"])
         .reset_index(drop=True)
     )
-    season_counts = source_matches["season_id"].value_counts()
-    if (season_counts < 2).any():
-        too_small = sorted(season_counts[season_counts < 2].index.tolist())
-        raise ValueError(f"Cannot stratify source split by season_id; too few games in seasons: {too_small}")
+    source_season_counts = (
+        df_source[["season_id", "season_name", "game_id"]]
+        .drop_duplicates(subset=["season_id", "game_id"])
+        .groupby(["season_id", "season_name"], as_index=False)
+        .agg(n_games=("game_id", "nunique"))
+        .sort_values(["season_id", "season_name"])
+        .reset_index(drop=True)
+    )
+    undersized_source_seasons = source_season_counts[source_season_counts["n_games"] < 2].copy()
+    undersized_season_ids = undersized_source_seasons["season_id"].tolist()
+    if undersized_season_ids:
+        logger.warning(
+            "load_xy_competition_season_split: excluding source seasons from validation "
+            "because they have too few games for season stratification; keeping them in "
+            "source_train only: %s",
+            undersized_source_seasons.to_dict("records"),
+        )
+
+    stratifiable_matches = source_matches[~source_matches["season_id"].isin(undersized_season_ids)].reset_index(drop=True)
+    pinned_train_matches = source_matches[source_matches["season_id"].isin(undersized_season_ids)].reset_index(drop=True)
+
+    if stratifiable_matches.empty:
+        raise ValueError(
+            "Source validation split cannot be stratified because no source season has at least 2 games"
+        )
 
     train_matches, val_matches = train_test_split(
-        source_matches,
+        stratifiable_matches,
         test_size=validation_frac,
-        stratify=source_matches["season_id"],
+        stratify=stratifiable_matches["season_id"],
         random_state=random_state,
     )
+    if not pinned_train_matches.empty:
+        train_matches = pd.concat([train_matches, pinned_train_matches], ignore_index=True)
     train_game_ids = set(train_matches["game_id"].tolist())
     val_game_ids = set(val_matches["game_id"].tolist())
 

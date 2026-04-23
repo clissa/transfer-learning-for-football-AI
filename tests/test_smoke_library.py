@@ -676,3 +676,49 @@ def test_load_xy_competition_season_split_stratifies_source_by_season(monkeypatc
         tuple(row) for row in league_shift.competition_seasons[["competition_name", "season_name"]].itertuples(index=False, name=None)
     }
     assert resolved.target.competitions == ["FA Women's Super League"]
+
+
+def test_load_xy_competition_season_split_keeps_undersized_source_season_in_train(
+    monkeypatch,
+    caplog,
+    split_refactor_df,
+    split_refactor_config,
+):
+    undersized_rows = split_refactor_df[
+        (split_refactor_df["competition_name"] == "La Liga")
+        & (split_refactor_df["season_name"] == "2015/2016")
+    ].iloc[:3].copy()
+    undersized_rows["game_id"] = 9999
+    undersized_rows["season_name"] = "2017/2018"
+    undersized_rows["season_id"] = 278
+
+    extended_df = pd.concat([split_refactor_df, undersized_rows], ignore_index=True)
+    monkeypatch.setattr("football_ai.training.read_h5_table", lambda data_file, key_candidates: extended_df.copy())
+
+    with caplog.at_level("WARNING"):
+        resolved = load_xy_competition_season_split(
+            target_col="scores",
+            data_file="unused.h5",
+            key_candidates=["vaep_data"],
+            split_config=split_refactor_config,
+            validation_frac=0.5,
+            random_state=7,
+        )
+
+    train_counts = (
+        resolved.source_train.df[["game_id", "season_id"]]
+        .drop_duplicates()["season_id"]
+        .value_counts()
+        .to_dict()
+    )
+    val_counts = (
+        resolved.source_val.df[["game_id", "season_id"]]
+        .drop_duplicates()["season_id"]
+        .value_counts()
+        .to_dict()
+    )
+
+    assert train_counts[278] == 1
+    assert 278 not in val_counts
+    assert "keeping them in source_train only" in caplog.text
+    assert "278" in caplog.text

@@ -26,7 +26,7 @@ Data pipeline steps:
 │   ├── create_vaep_features.py    # VAEP feature extraction CLI
 │   ├── train.py                   # sklearn training CLI
 │   ├── train_xgboost.py           # XGBoost training CLI
-│   └── tune_xgboost_bayes_v2.py   # Bayesian tuning CLI (Optuna)
+│   └── tune_xgboost.py            # Bayesian tuning CLI (Optuna)
 ├── src/football_ai/
 │   ├── __init__.py
 │   ├── config.py                  # YAML loading, CLI override merging
@@ -99,7 +99,7 @@ Override options via CLI, e.g. `--target-col concedes`.
 ### Bayesian hyperparameter tuning (Optuna + XGBoost)
 
 ```bash
-python -m scripts.tune_xgboost_bayes_v2 --config configs/tune_xgboost.yaml
+python -m scripts.tune_xgboost --config configs/tune_xgboost.yaml
 ```
 
 Override options via CLI, e.g. `--n-trials 50`.
@@ -130,4 +130,3 @@ The `notebooks/` folder contains exploratory Jupyter notebooks:
 - `socceraction_supervised_learning_simple.ipynb` — Simplified version with GridSearchCV tuning.
 
 > **Note:** Notebooks are exploratory and may not reflect the latest library API. For production workflows, use the scripts above.
-

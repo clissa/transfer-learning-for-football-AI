@@ -117,6 +117,17 @@ from .training import (
     save_model,
     tune_models,
 )
+from .tuning import (
+    SELECTED_METRIC,
+    XGBoostTuningResult,
+    build_xgboost_tuning_objective,
+    empirical_scale_pos_weight,
+    resolve_xgboost_tuning_config,
+    run_xgboost_tuning,
+    sample_xgboost_tuning_params,
+    source_val_metrics_by_season,
+    write_post_study_diagnostics,
+)
 
 __all__ = [
     # config
@@ -237,4 +248,14 @@ __all__ = [
     "sample_target_games",
     "save_model",
     "tune_models",
+    # tuning
+    "SELECTED_METRIC",
+    "XGBoostTuningResult",
+    "build_xgboost_tuning_objective",
+    "empirical_scale_pos_weight",
+    "resolve_xgboost_tuning_config",
+    "run_xgboost_tuning",
+    "sample_xgboost_tuning_params",
+    "source_val_metrics_by_season",
+    "write_post_study_diagnostics",
 ]
