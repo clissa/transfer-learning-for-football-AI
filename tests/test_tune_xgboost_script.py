@@ -201,9 +201,13 @@ class _FakeOptuna:
 
     def __init__(self) -> None:
         self.study = _FakeStudy()
+        self.study_name: str | None = None
+        self.direction: str | None = None
 
     def create_study(self, study_name: str, direction: str, sampler: Any) -> _FakeStudy:
-        assert direction == "maximize"
+        assert direction in {"maximize", "minimize"}
+        self.study_name = study_name
+        self.direction = direction
         return self.study
 
 
@@ -314,6 +318,26 @@ def test_default_tune_config_uses_cpu_device():
     assert resolved["model"]["base_params"]["device"] == "cpu"
 
 
+def test_tune_config_accepts_custom_selected_metric(tmp_path):
+    cfg = _base_tuning_cfg(tmp_path / "results")
+    cfg["selected_metric"] = "f1"
+
+    resolved = tuning.resolve_xgboost_tuning_config(cfg)
+
+    assert resolved["selected_metric"] == "f1"
+    assert resolved["selected_metric_direction"] == "maximize"
+
+
+def test_tune_config_sets_minimize_direction_for_loss_metric(tmp_path):
+    cfg = _base_tuning_cfg(tmp_path / "results")
+    cfg["selected_metric"] = "logloss"
+
+    resolved = tuning.resolve_xgboost_tuning_config(cfg)
+
+    assert resolved["selected_metric"] == "logloss"
+    assert resolved["selected_metric_direction"] == "minimize"
+
+
 def test_sample_search_space_uses_requested_n_estimators_range():
     trial = _FakeTrial()
     params = tuning.sample_xgboost_tuning_params(
@@ -328,8 +352,9 @@ def test_sample_search_space_uses_requested_n_estimators_range():
     assert params["max_depth"] == 4
 
 
-def test_objective_uses_only_source_splits_and_returns_source_val_roc_auc(monkeypatch, tmp_path):
+def test_objective_uses_only_source_splits_and_returns_selected_metric(monkeypatch, tmp_path):
     fake_split = _FakeResolvedSplit()
+    fake_split.source_val.X.loc[10, "score_hint"] = np.float32(0.6)
     monkeypatch.setattr(tuning, "XGBClassifier", _DummyXGBClassifier)
     _DummyXGBClassifier.fit_calls = []
 
@@ -339,13 +364,15 @@ def test_objective_uses_only_source_splits_and_returns_source_val_roc_auc(monkey
         search_space=_base_tuning_cfg(tmp_path)["search_space"],
         run_dir=tmp_path,
         source_train_empirical_spw=1.0,
+        selected_metric="f1",
     )
     trial = _FakeTrial()
 
     value = objective(trial)
 
-    assert value == 1.0
+    assert np.isclose(value, 0.8)
     assert trial.user_attrs["source_val_roc_auc"] == 1.0
+    assert np.isclose(trial.user_attrs["source_val_f1"], 0.8)
     assert not fake_split.is_materialized("calib")
     assert not fake_split.is_materialized("target")
     assert not fake_split.is_materialized("test_league_shift")
@@ -395,8 +422,38 @@ def test_run_tuning_writes_timestamped_artifacts_and_post_study_diagnostics(monk
 
     manifest = pd.read_json(result.manifest_path, typ="series").to_dict()
     assert manifest["selected_metric"] == "roc_auc"
+    assert manifest["selected_metric_direction"] == "maximize"
+    assert manifest["best_source_val_metric"] == 1.0
+    assert manifest["best_source_val_roc_auc"] == 1.0
     assert manifest["seed"] == 123
     assert manifest["best_trial_number"] == 0
+
+
+def test_run_tuning_uses_configured_selected_metric(monkeypatch, tmp_path):
+    fake_split = _FakeResolvedSplit()
+    fake_optuna = _FakeOptuna()
+    monkeypatch.setattr(tuning, "optuna", fake_optuna)
+    monkeypatch.setattr(tuning, "XGBClassifier", _DummyXGBClassifier)
+    monkeypatch.setattr(tuning, "load_xy_competition_season_split", lambda **_kwargs: fake_split)
+    monkeypatch.setattr(tuning, "save_model", lambda model, path: Path(path).write_text("model", encoding="utf-8"))
+    _DummyXGBClassifier.fit_calls = []
+    cfg = _base_tuning_cfg(tmp_path / "results", seed=123)
+    cfg["selected_metric"] = "f1"
+
+    result = tuning.run_xgboost_tuning(
+        cfg,
+        run_timestamp=datetime(2026, 1, 2, 3, 4, 5),
+    )
+
+    assert result.selected_metric == "f1"
+    assert fake_optuna.direction == "maximize"
+    assert fake_optuna.study_name == "xgb_f1_scores_20260102_030405_seed123"
+
+    manifest = pd.read_json(result.manifest_path, typ="series").to_dict()
+    assert manifest["selected_metric"] == "f1"
+    assert manifest["selected_metric_direction"] == "maximize"
+    assert manifest["best_source_val_metric"] == 1.0
+    assert manifest["best_source_val_f1"] == 1.0
 
 
 def test_null_seed_is_resolved_and_tracked(monkeypatch, tmp_path):
