@@ -119,13 +119,17 @@ from .training import (
 )
 from .tuning import (
     SELECTED_METRIC,
+    SUPPORTED_TUNING_METRICS,
+    TUNING_METRIC_DIRECTIONS,
     XGBoostTuningResult,
     build_xgboost_tuning_objective,
     empirical_scale_pos_weight,
+    normalize_tuning_metric,
     resolve_xgboost_tuning_config,
     run_xgboost_tuning,
     sample_xgboost_tuning_params,
     source_val_metrics_by_season,
+    tuning_metric_direction,
     write_post_study_diagnostics,
 )
 
@@ -250,12 +254,16 @@ __all__ = [
     "tune_models",
     # tuning
     "SELECTED_METRIC",
+    "SUPPORTED_TUNING_METRICS",
+    "TUNING_METRIC_DIRECTIONS",
     "XGBoostTuningResult",
     "build_xgboost_tuning_objective",
     "empirical_scale_pos_weight",
+    "normalize_tuning_metric",
     "resolve_xgboost_tuning_config",
     "run_xgboost_tuning",
     "sample_xgboost_tuning_params",
     "source_val_metrics_by_season",
+    "tuning_metric_direction",
     "write_post_study_diagnostics",
 ]

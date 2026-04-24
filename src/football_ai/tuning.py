@@ -37,6 +37,24 @@ optuna: Any | None = None
 XGBClassifier: Any | None = None
 
 SELECTED_METRIC = "roc_auc"
+SUPPORTED_TUNING_METRICS = (
+    "precision",
+    "recall",
+    "f1",
+    "roc_auc",
+    "pr_auc",
+    "brier",
+    "logloss",
+)
+TUNING_METRIC_DIRECTIONS = {
+    "precision": "maximize",
+    "recall": "maximize",
+    "f1": "maximize",
+    "roc_auc": "maximize",
+    "pr_auc": "maximize",
+    "brier": "minimize",
+    "logloss": "minimize",
+}
 DEFAULT_CONFIG_PATH = Path("configs/tune_xgboost.yaml")
 DEFAULT_KEY_CANDIDATES = ["feat_engineered_vaep_data", "vaep_data"]
 
@@ -50,6 +68,7 @@ class XGBoostTuningResult:
     best_score: float
     best_params: dict[str, Any]
     manifest_path: Path
+    selected_metric: str = SELECTED_METRIC
 
 
 def _require_optuna() -> Any:
@@ -85,11 +104,36 @@ def normalize_key_candidates(raw_value: str | Sequence[str]) -> list[str]:
     return [str(item) for item in raw_value]
 
 
+def normalize_tuning_metric(raw_value: Any) -> str:
+    """Return a validated source-validation metric name for trial ranking."""
+    selected_metric = str(raw_value or SELECTED_METRIC).strip().lower()
+    aliases = {
+        "auc": "roc_auc",
+        "aucpr": "pr_auc",
+        "average_precision": "pr_auc",
+        "f1_score": "f1",
+        "log_loss": "logloss",
+    }
+    selected_metric = aliases.get(selected_metric, selected_metric)
+    if selected_metric not in TUNING_METRIC_DIRECTIONS:
+        supported = ", ".join(SUPPORTED_TUNING_METRICS)
+        raise ValueError(
+            f"Unsupported selected_metric {selected_metric!r}. "
+            f"Choose one of: {supported}."
+        )
+    return selected_metric
+
+
+def tuning_metric_direction(selected_metric: str) -> str:
+    """Return the Optuna optimization direction for a selected metric."""
+    return TUNING_METRIC_DIRECTIONS[normalize_tuning_metric(selected_metric)]
+
+
 def resolve_xgboost_tuning_config(
     cfg: Mapping[str, Any],
     cli_overrides: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Merge YAML config with CLI overrides and enforce ROC-AUC tuning semantics.
+    """Merge YAML config with CLI overrides and resolve tuning defaults.
 
     Args:
         cfg: Parsed YAML mapping.
@@ -127,10 +171,9 @@ def resolve_xgboost_tuning_config(
     if overrides.get("device") is not None:
         effective["device"] = overrides["device"]
 
-    selected_metric = effective.get("selected_metric", SELECTED_METRIC)
-    if selected_metric != SELECTED_METRIC:
-        raise ValueError("XGBoost tuning ranks trials only by source-validation roc_auc")
-    effective["selected_metric"] = SELECTED_METRIC
+    selected_metric = normalize_tuning_metric(effective.get("selected_metric", SELECTED_METRIC))
+    effective["selected_metric"] = selected_metric
+    effective["selected_metric_direction"] = tuning_metric_direction(selected_metric)
 
     effective["data"].setdefault("file", "data/feat_engineered_vaep_data/major_leagues_vaep.h5")
     effective["data"]["key_candidates"] = normalize_key_candidates(
@@ -153,7 +196,7 @@ def resolve_xgboost_tuning_config(
     threshold.setdefault("max", 0.95)
     threshold.setdefault("steps", 90)
 
-    effective["output"].setdefault("root", "results/xgboost_tuning/roc_auc_scores")
+    effective["output"].setdefault("root", f"results/xgboost_tuning/{selected_metric}_scores")
 
     base_params = dict(effective["model"].get("base_params", {}))
     base_params.update(
@@ -343,8 +386,10 @@ def build_xgboost_tuning_objective(
     search_space: Mapping[str, Any],
     run_dir: Path,
     source_train_empirical_spw: float,
+    selected_metric: str = SELECTED_METRIC,
 ) -> Any:
     """Build an Optuna objective using only source-train and source-val splits."""
+    selected_metric = normalize_tuning_metric(selected_metric)
     X_train = resolved_split.source_train.X
     y_train = resolved_split.source_train.y.astype(np.uint8)
     X_val = resolved_split.source_val.X.reindex(columns=list(X_train.columns))
@@ -366,10 +411,8 @@ def build_xgboost_tuning_objective(
         y_val_score = get_positive_class_scores(model, X_val)
         metrics = evaluate_binary(y_val_score, y_val)
 
-        trial.set_user_attr("source_val_roc_auc", metrics["roc_auc"])
-        trial.set_user_attr("source_val_pr_auc", metrics["pr_auc"])
-        trial.set_user_attr("source_val_logloss", metrics["logloss"])
-        trial.set_user_attr("source_val_brier", metrics["brier"])
+        for metric_name, metric_value in metrics.items():
+            trial.set_user_attr(f"source_val_{metric_name}", metric_value)
         trial.set_user_attr("source_train_empirical_scale_pos_weight", source_train_empirical_spw)
         trial.set_user_attr("xgb_params", _jsonable(params))
 
@@ -379,7 +422,7 @@ def build_xgboost_tuning_objective(
             run_dir / f"trial_{trial.number}_la_liga_val_by_season.csv",
             index=False,
         )
-        return float(metrics[SELECTED_METRIC])
+        return float(metrics[selected_metric])
 
     return objective
 
@@ -489,11 +532,13 @@ def run_xgboost_tuning(
     cli_overrides: Mapping[str, Any] | None = None,
     run_timestamp: datetime | None = None,
 ) -> XGBoostTuningResult:
-    """Run an ROC-AUC-ranked Optuna tuning study and write all artifacts."""
+    """Run an Optuna tuning study and write all artifacts."""
     optuna_module = _require_optuna()
     effective_cfg = resolve_xgboost_tuning_config(cfg, cli_overrides=cli_overrides)
 
     seed = int(effective_cfg["seed"])
+    selected_metric = str(effective_cfg["selected_metric"])
+    selected_metric_direction = str(effective_cfg["selected_metric_direction"])
     data_file = Path(effective_cfg["data"]["file"])
     key_candidates = normalize_key_candidates(effective_cfg["data"]["key_candidates"])
     target_col = str(effective_cfg["data"]["target_col"])
@@ -530,12 +575,13 @@ def run_xgboost_tuning(
         search_space=search_space,
         run_dir=run_dir,
         source_train_empirical_spw=source_train_spw,
+        selected_metric=selected_metric,
     )
 
     sampler = optuna_module.samplers.TPESampler(seed=seed)
     study = optuna_module.create_study(
-        study_name=f"xgb_roc_auc_{target_col}_{run_id}_seed{seed}",
-        direction="maximize",
+        study_name=f"xgb_{selected_metric}_{target_col}_{run_id}_seed{seed}",
+        direction=selected_metric_direction,
         sampler=sampler,
     )
     study.optimize(
@@ -547,7 +593,10 @@ def run_xgboost_tuning(
 
     trials_df = _study_trials_dataframe(study)
     if "value" in trials_df.columns:
-        trials_df = trials_df.sort_values("value", ascending=False).reset_index(drop=True)
+        trials_df = trials_df.sort_values(
+            "value",
+            ascending=(selected_metric_direction == "minimize"),
+        ).reset_index(drop=True)
     trials_path = run_dir / "trials.csv"
     trials_df.to_csv(trials_path, index=False)
 
@@ -608,9 +657,11 @@ def run_xgboost_tuning(
         "split_config": effective_cfg["split"],
         "seed": seed,
         "device": effective_cfg["device"],
-        "selected_metric": SELECTED_METRIC,
+        "selected_metric": selected_metric,
+        "selected_metric_direction": selected_metric_direction,
         "best_trial_number": study.best_trial.number,
-        "best_source_val_roc_auc": float(study.best_value),
+        "best_source_val_metric": float(study.best_value),
+        f"best_source_val_{selected_metric}": float(study.best_value),
         "selected_threshold": diagnostic_outputs["selected_threshold"],
         "source_train_empirical_scale_pos_weight": source_train_spw,
         "artifact_paths": artifact_paths,
@@ -620,8 +671,9 @@ def run_xgboost_tuning(
     _write_json(manifest_path, manifest)
 
     logger.info(
-        "Best trial %s source-val ROC-AUC %.6f; outputs in %s",
+        "Best trial %s source-val %s %.6f; outputs in %s",
         study.best_trial.number,
+        selected_metric,
         float(study.best_value),
         run_dir,
     )
@@ -631,4 +683,5 @@ def run_xgboost_tuning(
         best_score=float(study.best_value),
         best_params=best_params,
         manifest_path=manifest_path,
+        selected_metric=selected_metric,
     )

@@ -6,6 +6,8 @@ data:
   key_candidates: ["feat_engineered_vaep_data", "vaep_data"]
   target_col: "scores"  # or "concedes"
 
+# Metric used to rank Optuna trials. Supported values:
+# roc_auc, pr_auc, precision, recall, f1, brier, logloss.
 selected_metric: "roc_auc"
 seed: null
 device: "cpu"
@@ -101,4 +103,4 @@ threshold:
   steps: 90
 
 output:
-  root: "results/xgboost_tuning/roc_auc_scores"
+  root: "results/xgboost_tuning"

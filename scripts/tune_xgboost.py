@@ -1,4 +1,4 @@
-"""CLI wrapper for ROC-AUC-ranked XGBoost tuning.
+"""CLI wrapper for metric-ranked XGBoost tuning.
 
 Core tuning logic lives in ``football_ai.tuning``.  This script only handles
 argparse, YAML loading, and CLI overrides.
@@ -53,7 +53,7 @@ def main() -> int:
     cfg = load_config(args.config)
     result = run_xgboost_tuning(cfg, cli_overrides=_cli_overrides(args))
     print(f"Best trial: {result.best_trial_number}")
-    print(f"Best source-val ROC-AUC: {result.best_score:.6f}")
+    print(f"Best source-val {result.selected_metric}: {result.best_score:.6f}")
     print(f"Results saved in: {result.run_dir.resolve()}")
     return 0
 
